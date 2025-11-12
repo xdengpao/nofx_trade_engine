@@ -116,7 +116,7 @@ func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error)
 	}
 
 	// 4. 解析AI响应
-	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
+	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.AvailableBalance, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
 	if err != nil {
 		return nil, fmt.Errorf("解析AI响应失败: %w", err)
 	}
@@ -657,7 +657,7 @@ func buildUserPrompt(ctx *Context) string {
 }
 
 // parseFullDecisionResponse 解析AI的完整决策响应
-func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int) (*FullDecision, error) {
+func parseFullDecisionResponse(aiResponse string, availableBalance float64, btcEthLeverage, altcoinLeverage int) (*FullDecision, error) {
 	// 1. 提取思维链
 	cotTrace := extractCoTTrace(aiResponse)
 
@@ -671,7 +671,7 @@ func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthL
 	}
 
 	// 3. 验证决策
-	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
+	if err := validateDecisions(decisions, availableBalance, btcEthLeverage, altcoinLeverage); err != nil {
 		return &FullDecision{
 			CoTTrace:  cotTrace,
 			Decisions: decisions,
@@ -739,9 +739,9 @@ func fixMissingQuotes(jsonStr string) string {
 }
 
 // validateDecisions 验证所有决策（需要账户信息和杠杆配置）
-func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int) error {
+func validateDecisions(decisions []Decision, availableBalance float64, btcEthLeverage, altcoinLeverage int) error {
 	for i, decision := range decisions {
-		if err := validateDecision(&decision, accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
+		if err := validateDecision(&decision, availableBalance, btcEthLeverage, altcoinLeverage); err != nil {
 			return fmt.Errorf("决策 #%d 验证失败: %w", i+1, err)
 		}
 	}
@@ -771,7 +771,7 @@ func findMatchingBracket(s string, start int) int {
 }
 
 // validateDecision 验证单个决策的有效性
-func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int) error {
+func validateDecision(d *Decision, availableBalance float64, btcEthLeverage, altcoinLeverage int) error {
 	// 验证action
 	validActions := map[string]bool{
 		"open_long":          true,
@@ -793,10 +793,10 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 	if d.Action == "open_long" || d.Action == "open_short" {
 		// 根据币种使用配置的杠杆上限
 		maxLeverage := altcoinLeverage                               // 山寨币使用配置的杠杆
-		maxPositionValue := accountEquity * float64(altcoinLeverage) // 山寨币最多1.5倍账户净值
+		maxPositionValue := availableBalance * float64(altcoinLeverage) // 山寨币最多1.5倍账户净值
 		if d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT" {
 			maxLeverage = btcEthLeverage                               // BTC和ETH使用配置的杠杆
-			maxPositionValue = accountEquity * float64(btcEthLeverage) // BTC/ETH最多10倍账户净值
+			maxPositionValue = availableBalance * float64(btcEthLeverage) // BTC/ETH最多10倍账户净值
 		}
 
 		if d.Leverage <= 0 || d.Leverage > maxLeverage {
@@ -809,7 +809,7 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 		// 🔧 自动调整仓位大小到允许的最大值
 		if d.PositionSizeUSD > maxPositionValue {
 			log.Printf("⚠️  自动调整 %s 仓位大小: %.0f → %.0f USDT (账户净值: %.2f, 杠杆倍数: %d)",
-				d.Symbol, d.PositionSizeUSD, maxPositionValue, accountEquity, maxLeverage)
+				d.Symbol, d.PositionSizeUSD, maxPositionValue, availableBalance, maxLeverage)
 			//最大仓位的90%
 			d.PositionSizeUSD = maxPositionValue * 0.9
 		}
