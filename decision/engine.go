@@ -929,7 +929,9 @@ func validateSingleDecisionEnhanced(d *Decision, ctx *Context) error {
 		// 单笔风险验证
 		positionRiskUSD := d.PositionSizeUSD * (riskPct / 100)
 		maxRiskUSD := ctx.Account.TotalEquity * ctx.MaxRiskPerTrade
-		if positionRiskUSD > maxRiskUSD {
+		// ✅ 添加 1% 容差或 0.01 USD 绝对容差
+		tolerance := math.Max(maxRiskUSD*0.01, 0.01)
+		if positionRiskUSD > maxRiskUSD + tolerance{
 			return fmt.Errorf("单笔风险(%.2f USD)超过上限(%.2f USD, %.1f%%账户净值)",
 				positionRiskUSD, maxRiskUSD, ctx.MaxRiskPerTrade*100)
 		}
