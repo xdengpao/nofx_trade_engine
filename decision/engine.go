@@ -139,10 +139,10 @@ func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error)
 
 	// 1. 初始化风险参数
 	if ctx.MaxRiskPerTrade == 0 {
-		ctx.MaxRiskPerTrade = 0.02 // 默认单笔风险2%
+		ctx.MaxRiskPerTrade = 0.03 // 默认单笔风险3%
 	}
 	if ctx.TotalRiskBudget == 0 {
-		ctx.TotalRiskBudget = 0.05 // 默认总风险预算5%
+		ctx.TotalRiskBudget = 0.08 // 默认总风险预算8%
 	}
 
 	// 2. 获取市场数据
@@ -383,7 +383,7 @@ func buildSystemPromptEnhanced(ctx *Context) string {
 	sb.WriteString("# 💵 波动率自适应仓位计算（核心优化）\n\n")
 	sb.WriteString("**公式**:\n")
 	sb.WriteString("```\n")
-	sb.WriteString("止损距离 = ATR14 × 倍数（山寨2.5，BTC/ETH 1.8）\n")
+	sb.WriteString("止损距离 = ATR14 × 倍数（山寨3.5，BTC/ETH 2.5）\n")
 	sb.WriteString("仓位大小 = (账户净值 × 单笔风险比例) / 止损百分比\n")
 	sb.WriteString("```\n")
 	sb.WriteString("**示例**: 账户1000 USDT，ATR14=50，当前价=1000，风险2%\n")
@@ -451,9 +451,9 @@ func buildSystemPromptEnhanced(ctx *Context) string {
 	sb.WriteString("# 📊 移动止损规则\n\n")
 	sb.WriteString("| 盈利阈值 | 止损调整 |\n")
 	sb.WriteString("|---------|----------|\n")
-	sb.WriteString("| ≥3% | 移至入场价（保本）|\n")
-	sb.WriteString("| ≥5% | 移至盈利2%位置 |\n")
-	sb.WriteString("| ≥10% | 移至盈利5%位置 |\n\n")
+	sb.WriteString("| ≥7% | 移至入场价（保本）|\n")
+	sb.WriteString("| ≥10% | 移至盈利2%位置 |\n")
+	sb.WriteString("| ≥15% | 移至盈利5%位置 |\n\n")
 
 	// === 分批止盈规则 ===
 	sb.WriteString("# 🎯 分批止盈规则\n\n")
@@ -568,19 +568,19 @@ func buildUserPromptEnhanced(ctx *Context) string {
 				pos.MarginUsed, pos.LiquidationPrice, corrInfo))
 
 			// 移动止损建议
-			if pos.UnrealizedPnLPct >= 10 {
+			if pos.UnrealizedPnLPct >= 15 {
 				newSL := pos.EntryPrice * 1.05 // 锁定5%盈利
 				if pos.Side == "short" {
 					newSL = pos.EntryPrice * 0.95
 				}
 				sb.WriteString(fmt.Sprintf("⚠️ **建议移动止损至 %.4f** (锁定5%%盈利)\n\n", newSL))
-			} else if pos.UnrealizedPnLPct >= 5 {
+			} else if pos.UnrealizedPnLPct >= 10 {
 				newSL := pos.EntryPrice * 1.02
 				if pos.Side == "short" {
 					newSL = pos.EntryPrice * 0.98
 				}
 				sb.WriteString(fmt.Sprintf("⚠️ **建议移动止损至 %.4f** (锁定2%%盈利)\n\n", newSL))
-			} else if pos.UnrealizedPnLPct >= 3 {
+			} else if pos.UnrealizedPnLPct >= 7 {
 				sb.WriteString(fmt.Sprintf("⚠️ **建议移动止损至入场价 %.4f** (保本)\n\n", pos.EntryPrice))
 			}
 
@@ -691,9 +691,11 @@ func calculateUsedRisk(ctx *Context) float64 {
 		posRisk := pos.MarginUsed / ctx.Account.TotalEquity
 
 		// 应用相关性风险权重
-		if corr, ok := ctx.CorrelationMap[pos.Symbol]; ok {
-			posRisk *= corr.RiskWeight
-		}
+		// 注意: 相关性风险权重已在仓位验证时应用，此处不再重复计算        
+		// 避免双重惩罚导致风险预算计算失真
+		//if corr, ok := ctx.CorrelationMap[pos.Symbol]; ok {
+		//	posRisk *= corr.RiskWeight
+		//}
 
 		totalRisk += posRisk
 	}
@@ -921,8 +923,8 @@ func validateSingleDecisionEnhanced(d *Decision, ctx *Context) error {
 		}
 
 		riskRewardRatio := netRewardPct / riskPct
-		if riskRewardRatio < 3.0 {
-			return fmt.Errorf("真实风险回报比过低(%.2f:1 < 3:1) [风险:%.2f%% 净收益:%.2f%% 成本:%.2f%%]",
+		if riskRewardRatio < 2.5 {
+			return fmt.Errorf("真实风险回报比过低(%.2f:1 < 2.5:1) [风险:%.2f%% 净收益:%.2f%% 成本:%.2f%%]",
 				riskRewardRatio, riskPct, netRewardPct, tradingCost)
 		}
 
