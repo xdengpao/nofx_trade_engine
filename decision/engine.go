@@ -792,6 +792,30 @@ func findMatchingBracket(s string, start int) int {
 
 // validateDecisionsEnhanced 增强版决策验证
 func validateDecisionsEnhanced(decisions []Decision, ctx *Context) error {
+	// === 新增：持仓保护期检查 ===
+	positionMap := make(map[string]*PositionInfo)
+	for i := range ctx.Positions {
+		positionMap[ctx.Positions[i].Symbol] = &ctx.Positions[i]
+	}
+	for _, decision := range decisions {
+		if decision.Action == "close_long" || decision.Action == "close_short" || decision.Action == "partial_close" {
+			if pos, exists := positionMap[decision.Symbol]; exists {
+				holdingMinutes := int64(0)
+				if pos.UpdateTime > 0 {
+					holdingMinutes = (time.Now().UnixMilli() - pos.UpdateTime) / (1000 * 60)
+				}
+				// 15分钟保护期
+				if holdingMinutes < 15 {
+					// 只允许亏损超过1.5%时提前平仓
+					if pos.UnrealizedPnLPct > -1.5 {
+						return fmt.Errorf("❌ %s 在保护期内（%d/15分钟），禁止平仓",decision.Symbol, holdingMinutes)
+					}
+				}
+			}
+		}
+	}
+	// === 保护期检查结束 ===		
+	
 	// 统计开仓决策
 	newPositions := 0
 	sameDirectionHighCorr := make(map[string]int) // 同方向高相关持仓计数
