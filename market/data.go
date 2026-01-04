@@ -1179,9 +1179,9 @@ func parseFloat(v interface{}) (float64, error) {
 // CalculateAdaptivePositionSize 计算波动率自适应仓位（新增核心函数）
 func CalculateAdaptivePositionSize(equity, atr, currentPrice, riskPct float64, isAltcoin bool) (positionSize, stopDistance float64) {
 	// ATR倍数：山寨币波动大，用更大倍数
-	multiplier := 1.8 // BTC/ETH
+	multiplier := 2.5 // BTC/ETH
 	if isAltcoin {
-		multiplier = 2.5
+		multiplier = 3.5
 	}
 
 	// 止损距离 = ATR × 倍数
