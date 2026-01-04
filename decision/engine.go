@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"nofx/market"
 	"nofx/mcp"
 	"nofx/pool"
@@ -14,7 +15,7 @@ import (
 // PositionInfo 持仓信息
 type PositionInfo struct {
 	Symbol           string  `json:"symbol"`
-	Side             string  `json:"side"` // "long" or "short"
+	Side             string  `json:"side"`
 	EntryPrice       float64 `json:"entry_price"`
 	MarkPrice        float64 `json:"mark_price"`
 	Quantity         float64 `json:"quantity"`
@@ -23,123 +24,274 @@ type PositionInfo struct {
 	UnrealizedPnLPct float64 `json:"unrealized_pnl_pct"`
 	LiquidationPrice float64 `json:"liquidation_price"`
 	MarginUsed       float64 `json:"margin_used"`
-	UpdateTime       int64   `json:"update_time"` // 持仓更新时间戳（毫秒）
+	UpdateTime       int64   `json:"update_time"`
+	StopLoss         float64 `json:"stop_loss,omitempty"`   // 新增：当前止损价
+	TakeProfit       float64 `json:"take_profit,omitempty"` // 新增：当前止盈价
 }
 
 // AccountInfo 账户信息
 type AccountInfo struct {
-	TotalEquity      float64 `json:"total_equity"`      // 账户净值
-	AvailableBalance float64 `json:"available_balance"` // 可用余额
-	TotalPnL         float64 `json:"total_pnl"`         // 总盈亏
-	TotalPnLPct      float64 `json:"total_pnl_pct"`     // 总盈亏百分比
-	MarginUsed       float64 `json:"margin_used"`       // 已用保证金
-	MarginUsedPct    float64 `json:"margin_used_pct"`   // 保证金使用率
-	PositionCount    int     `json:"position_count"`    // 持仓数量
+	TotalEquity      float64 `json:"total_equity"`
+	AvailableBalance float64 `json:"available_balance"`
+	TotalPnL         float64 `json:"total_pnl"`
+	TotalPnLPct      float64 `json:"total_pnl_pct"`
+	MarginUsed       float64 `json:"margin_used"`
+	MarginUsedPct    float64 `json:"margin_used_pct"`
+	PositionCount    int     `json:"position_count"`
 }
 
-// CandidateCoin 候选币种（来自币种池）
+// CandidateCoin 候选币种
 type CandidateCoin struct {
 	Symbol  string   `json:"symbol"`
-	Sources []string `json:"sources"` // 来源: "ai500" 和/或 "oi_top"
+	Sources []string `json:"sources"`
 }
 
-// OITopData 持仓量增长Top数据（用于AI决策参考）
+// OITopData 持仓量增长Top数据
 type OITopData struct {
-	Rank              int     // OI Top排名
-	OIDeltaPercent    float64 // 持仓量变化百分比（1小时）
-	OIDeltaValue      float64 // 持仓量变化价值
-	PriceDeltaPercent float64 // 价格变化百分比
-	NetLong           float64 // 净多仓
-	NetShort          float64 // 净空仓
+	Rank              int
+	OIDeltaPercent    float64
+	OIDeltaValue      float64
+	PriceDeltaPercent float64
+	NetLong           float64
+	NetShort          float64
 }
 
-// Context 交易上下文（传递给AI的完整信息）
+// CorrelationData 相关性数据（新增）
+type CorrelationData struct {
+	Symbol     string  `json:"symbol"`
+	BTCCorr    float64 `json:"btc_correlation"` // 与BTC的相关系数
+	IsHighCorr bool    `json:"is_high_corr"`    // 是否高相关（>0.8）
+	RiskWeight float64 `json:"risk_weight"`     // 风险权重
+}
+
+// CircuitBreakerState 熔断状态（新增）
+type CircuitBreakerState struct {
+	IsTriggered     bool      `json:"is_triggered"`
+	TriggerReason   string    `json:"trigger_reason"`
+	TriggerTime     time.Time `json:"trigger_time"`
+	CooldownMinutes int       `json:"cooldown_minutes"`
+}
+
+// Context 交易上下文（优化版）
 type Context struct {
-	CurrentTime     string                  `json:"current_time"`
-	RuntimeMinutes  int                     `json:"runtime_minutes"`
-	CallCount       int                     `json:"call_count"`
-	Account         AccountInfo             `json:"account"`
-	Positions       []PositionInfo          `json:"positions"`
-	CandidateCoins  []CandidateCoin         `json:"candidate_coins"`
-	MarketDataMap   map[string]*market.Data `json:"-"` // 不序列化，但内部使用
-	OITopDataMap    map[string]*OITopData   `json:"-"` // OI Top数据映射
-	Performance     interface{}             `json:"-"` // 历史表现分析（logger.PerformanceAnalysis）
-	BTCETHLeverage  int                     `json:"-"` // BTC/ETH杠杆倍数（从配置读取）
-	AltcoinLeverage int                     `json:"-"` // 山寨币杠杆倍数（从配置读取）
+	CurrentTime     string                      `json:"current_time"`
+	RuntimeMinutes  int                         `json:"runtime_minutes"`
+	CallCount       int                         `json:"call_count"`
+	Account         AccountInfo                 `json:"account"`
+	Positions       []PositionInfo              `json:"positions"`
+	CandidateCoins  []CandidateCoin             `json:"candidate_coins"`
+	MarketDataMap   map[string]*market.Data     `json:"-"`
+	OITopDataMap    map[string]*OITopData       `json:"-"`
+	CorrelationMap  map[string]*CorrelationData `json:"-"` // 新增：相关性数据
+	CircuitBreaker  *CircuitBreakerState        `json:"-"` // 新增：熔断状态
+	Performance     interface{}                 `json:"-"`
+	BTCETHLeverage  int                         `json:"-"`
+	AltcoinLeverage int                         `json:"-"`
+	MaxRiskPerTrade float64                     `json:"-"` // 新增：单笔最大风险比例
+	TotalRiskBudget float64                     `json:"-"` // 新增：总风险预算
 }
 
 // Decision AI的交易决策
 type Decision struct {
-	Symbol string `json:"symbol"`
-	Action string `json:"action"` // "open_long", "open_short", "close_long", "close_short", "hold", "wait"
-
-	//开仓参数
+	Symbol          string  `json:"symbol"`
+	Action          string  `json:"action"`
 	Leverage        int     `json:"leverage,omitempty"`
 	PositionSizeUSD float64 `json:"position_size_usd,omitempty"`
 	StopLoss        float64 `json:"stop_loss,omitempty"`
 	TakeProfit      float64 `json:"take_profit,omitempty"`
-
-	// 调整参数（新增）
-	NewStopLoss     float64 `json:"new_stop_loss,omitempty"`    // 用于 update_stop_loss
-	NewTakeProfit   float64 `json:"new_take_profit,omitempty"`  // 用于 update_take_profit
-	ClosePercentage float64 `json:"close_percentage,omitempty"` // 用于 partial_close (0-100)
-
-	//通用参数
-	Confidence int     `json:"confidence,omitempty"` // 信心度 (0-100)
-	RiskUSD    float64 `json:"risk_usd,omitempty"`   // 最大美元风险
-	Reasoning  string  `json:"reasoning"`
+	NewStopLoss     float64 `json:"new_stop_loss,omitempty"`
+	NewTakeProfit   float64 `json:"new_take_profit,omitempty"`
+	ClosePercentage float64 `json:"close_percentage,omitempty"`
+	Confidence      int     `json:"confidence,omitempty"`
+	RiskUSD         float64 `json:"risk_usd,omitempty"`
+	Reasoning       string  `json:"reasoning"`
 }
 
-// FullDecision AI的完整决策（包含思维链）
+// FullDecision AI的完整决策
 type FullDecision struct {
-	UserPrompt string     `json:"user_prompt"` // 发送给AI的输入prompt
-	CoTTrace   string     `json:"cot_trace"`   // 思维链分析（AI输出）
-	Decisions  []Decision `json:"decisions"`   // 具体决策列表
+	UserPrompt string     `json:"user_prompt"`
+	CoTTrace   string     `json:"cot_trace"`
+	Decisions  []Decision `json:"decisions"`
 	Timestamp  time.Time  `json:"timestamp"`
 }
 
-// GetFullDecision 获取AI的完整交易决策（批量分析所有币种和持仓）
+// GetFullDecision 获取AI的完整交易决策（优化版）
 func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error) {
-	// 1. 为所有币种获取市场数据
+	// 0. 检查熔断状态
+	if ctx.CircuitBreaker != nil && ctx.CircuitBreaker.IsTriggered {
+		cooldownEnd := ctx.CircuitBreaker.TriggerTime.Add(time.Duration(ctx.CircuitBreaker.CooldownMinutes) * time.Minute)
+		if time.Now().Before(cooldownEnd) {
+			remainingMinutes := int(cooldownEnd.Sub(time.Now()).Minutes())
+			return &FullDecision{
+				CoTTrace: fmt.Sprintf("⚠️ 熔断中: %s | 剩余冷却时间: %d分钟",
+					ctx.CircuitBreaker.TriggerReason, remainingMinutes),
+				Decisions: []Decision{{
+					Symbol:    "ALL",
+					Action:    "wait",
+					Reasoning: fmt.Sprintf("熔断保护触发: %s", ctx.CircuitBreaker.TriggerReason),
+				}},
+				Timestamp: time.Now(),
+			}, nil
+		}
+		// 熔断结束，重置状态
+		ctx.CircuitBreaker.IsTriggered = false
+	}
+
+	// 1. 初始化风险参数
+	if ctx.MaxRiskPerTrade == 0 {
+		ctx.MaxRiskPerTrade = 0.02 // 默认单笔风险2%
+	}
+	if ctx.TotalRiskBudget == 0 {
+		ctx.TotalRiskBudget = 0.05 // 默认总风险预算5%
+	}
+
+	// 2. 获取市场数据
 	if err := fetchMarketDataForContext(ctx); err != nil {
 		return nil, fmt.Errorf("获取市场数据失败: %w", err)
 	}
 
-	// 2. 构建 System Prompt（固定规则）和 User Prompt（动态数据）
-	systemPrompt := buildSystemPrompt(ctx.Account.AvailableBalance, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
-	userPrompt := buildUserPrompt(ctx)
+	// 3. 检查熔断条件
+	if shouldTriggerCircuitBreaker(ctx) {
+		return &FullDecision{
+			CoTTrace: "🛑 触发熔断保护，暂停交易",
+			Decisions: []Decision{{
+				Symbol:    "ALL",
+				Action:    "wait",
+				Reasoning: ctx.CircuitBreaker.TriggerReason,
+			}},
+			Timestamp: time.Now(),
+		}, nil
+	}
 
-	// 3. 调用AI API（使用 system + user prompt）
+	// 4. 计算相关性矩阵
+	calculateCorrelationMatrix(ctx)
+
+	// 5. 构建prompts
+	systemPrompt := buildSystemPromptEnhanced(ctx)
+	userPrompt := buildUserPromptEnhanced(ctx)
+
+	// 6. 调用AI API
 	aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
 	if err != nil {
 		return nil, fmt.Errorf("调用AI API失败: %w", err)
 	}
 
-	// 4. 解析AI响应
-	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.AvailableBalance, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
+	// 7. 解析响应
+	decision, err := parseFullDecisionResponse(aiResponse, ctx)
 	if err != nil {
 		return nil, fmt.Errorf("解析AI响应失败: %w", err)
 	}
 
 	decision.Timestamp = time.Now()
-	decision.UserPrompt = userPrompt // 保存输入prompt
+	decision.UserPrompt = userPrompt
 	return decision, nil
 }
 
-// fetchMarketDataForContext 为上下文中的所有币种获取市场数据和OI数据
+// shouldTriggerCircuitBreaker 检查是否应该触发熔断（新增）
+func shouldTriggerCircuitBreaker(ctx *Context) bool {
+	if ctx.CircuitBreaker == nil {
+		ctx.CircuitBreaker = &CircuitBreakerState{}
+	}
+
+	// 条件1: BTC 1小时跌幅 > 5%
+	if btcData, ok := ctx.MarketDataMap["BTCUSDT"]; ok {
+		if btcData.PriceChange1h < -5.0 {
+			ctx.CircuitBreaker.IsTriggered = true
+			ctx.CircuitBreaker.TriggerReason = fmt.Sprintf("BTC 1小时暴跌 %.2f%%", btcData.PriceChange1h)
+			ctx.CircuitBreaker.TriggerTime = time.Now()
+			ctx.CircuitBreaker.CooldownMinutes = 30
+			log.Printf("🛑 熔断触发: %s", ctx.CircuitBreaker.TriggerReason)
+			return true
+		}
+	}
+
+	// 条件2: 账户日内回撤 > 10%
+	if ctx.Account.TotalPnLPct < -10.0 {
+		ctx.CircuitBreaker.IsTriggered = true
+		ctx.CircuitBreaker.TriggerReason = fmt.Sprintf("账户回撤 %.2f%% 超过10%%", ctx.Account.TotalPnLPct)
+		ctx.CircuitBreaker.TriggerTime = time.Now()
+		ctx.CircuitBreaker.CooldownMinutes = 60
+		log.Printf("🛑 熔断触发: %s", ctx.CircuitBreaker.TriggerReason)
+		return true
+	}
+
+	// 条件3: 保证金使用率 > 95%
+	if ctx.Account.MarginUsedPct > 95.0 {
+		ctx.CircuitBreaker.IsTriggered = true
+		ctx.CircuitBreaker.TriggerReason = fmt.Sprintf("保证金使用率 %.2f%% 过高", ctx.Account.MarginUsedPct)
+		ctx.CircuitBreaker.TriggerTime = time.Now()
+		ctx.CircuitBreaker.CooldownMinutes = 15
+		log.Printf("🛑 熔断触发: %s", ctx.CircuitBreaker.TriggerReason)
+		return true
+	}
+
+	return false
+}
+
+// calculateCorrelationMatrix 计算相关性矩阵（新增）
+func calculateCorrelationMatrix(ctx *Context) {
+	ctx.CorrelationMap = make(map[string]*CorrelationData)
+
+	// 获取BTC价格序列
+	btcData, hasBTC := ctx.MarketDataMap["BTCUSDT"]
+	if !hasBTC || btcData.MidTermSeries1h == nil {
+		return
+	}
+	btcPrices := btcData.MidTermSeries1h.MidPrices
+
+	for symbol, data := range ctx.MarketDataMap {
+		if symbol == "BTCUSDT" {
+			ctx.CorrelationMap[symbol] = &CorrelationData{
+				Symbol:     symbol,
+				BTCCorr:    1.0,
+				IsHighCorr: true,
+				RiskWeight: 1.0,
+			}
+			continue
+		}
+
+		if data.MidTermSeries1h == nil {
+			continue
+		}
+
+		prices := data.MidTermSeries1h.MidPrices
+		corr := market.CalculateCorrelation(btcPrices, prices)
+
+		isHighCorr := math.Abs(corr) > 0.8
+		riskWeight := 1.0
+		if isHighCorr {
+			riskWeight = 0.7 // 高相关资产风险权重降低
+		} else if math.Abs(corr) < 0.5 {
+			riskWeight = 1.0 // 低相关资产可以独立计算
+		} else {
+			riskWeight = 0.85
+		}
+
+		ctx.CorrelationMap[symbol] = &CorrelationData{
+			Symbol:     symbol,
+			BTCCorr:    corr,
+			IsHighCorr: isHighCorr,
+			RiskWeight: riskWeight,
+		}
+	}
+}
+
+// fetchMarketDataForContext 获取市场数据（优化版）
 func fetchMarketDataForContext(ctx *Context) error {
 	ctx.MarketDataMap = make(map[string]*market.Data)
 	ctx.OITopDataMap = make(map[string]*OITopData)
 
-	// 收集所有需要获取数据的币种
 	symbolSet := make(map[string]bool)
 
-	// 1. 优先获取持仓币种的数据（这是必须的）
+	// 必须包含BTC
+	symbolSet["BTCUSDT"] = true
+
+	// 持仓币种
 	for _, pos := range ctx.Positions {
 		symbolSet[pos.Symbol] = true
 	}
 
-	// 2. 候选币种数量根据账户状态动态调整
+	// 候选币种
 	maxCandidates := calculateMaxCandidates(ctx)
 	for i, coin := range ctx.CandidateCoins {
 		if i >= maxCandidates {
@@ -148,8 +300,7 @@ func fetchMarketDataForContext(ctx *Context) error {
 		symbolSet[coin.Symbol] = true
 	}
 
-	// 并发获取市场数据
-	// 持仓币种集合（用于判断是否跳过OI检查）
+	// 持仓币种集合
 	positionSymbols := make(map[string]bool)
 	for _, pos := range ctx.Positions {
 		positionSymbols[pos.Symbol] = true
@@ -158,21 +309,16 @@ func fetchMarketDataForContext(ctx *Context) error {
 	for symbol := range symbolSet {
 		data, err := market.Get(symbol)
 		if err != nil {
-			// 单个币种失败不影响整体，只记录错误
+			log.Printf("⚠️ 获取 %s 数据失败: %v", symbol, err)
 			continue
 		}
 
-		// ⚠️ 流动性过滤：持仓价值低于15M USD的币种不做（多空都不做）
-		// 持仓价值 = 持仓量 × 当前价格
-		// 但现有持仓必须保留（需要决策是否平仓）
+		// 流动性过滤（持仓除外）
 		isExistingPosition := positionSymbols[symbol]
-		if !isExistingPosition && data.OpenInterest != nil && data.CurrentPrice > 0 {
-			// 计算持仓价值（USD）= 持仓量 × 当前价格
-			oiValue := data.OpenInterest.Latest * data.CurrentPrice
-			oiValueInMillions := oiValue / 1_000_000 // 转换为百万美元单位
+		if !isExistingPosition && data.OIValueUSD > 0 {
+			oiValueInMillions := data.OIValueUSD / 1_000_000
 			if oiValueInMillions < 15 {
-				log.Printf("⚠️  %s 持仓价值过低(%.2fM USD < 15M)，跳过此币种 [持仓量:%.0f × 价格:%.4f]",
-					symbol, oiValueInMillions, data.OpenInterest.Latest, data.CurrentPrice)
+				log.Printf("⚠️ %s OI价值过低(%.2fM USD < 15M)，跳过", symbol, oiValueInMillions)
 				continue
 			}
 		}
@@ -180,13 +326,11 @@ func fetchMarketDataForContext(ctx *Context) error {
 		ctx.MarketDataMap[symbol] = data
 	}
 
-	// 加载OI Top数据（不影响主流程）
+	// 加载OI Top数据
 	oiPositions, err := pool.GetOITopPositions()
 	if err == nil {
 		for _, pos := range oiPositions {
-			// 标准化符号匹配
-			symbol := pos.Symbol
-			ctx.OITopDataMap[symbol] = &OITopData{
+			ctx.OITopDataMap[pos.Symbol] = &OITopData{
 				Rank:              pos.Rank,
 				OIDeltaPercent:    pos.OIDeltaPercent,
 				OIDeltaValue:      pos.OIDeltaValue,
@@ -200,378 +344,185 @@ func fetchMarketDataForContext(ctx *Context) error {
 	return nil
 }
 
-// calculateMaxCandidates 根据账户状态计算需要分析的候选币种数量
+// calculateMaxCandidates 计算候选币种数量
 func calculateMaxCandidates(ctx *Context) int {
-	// 直接返回候选池的全部币种数量
-	// 因为候选池已经在 auto_trader.go 中筛选过了
-	// 固定分析前20个评分最高的币种（来自AI500）
 	return len(ctx.CandidateCoins)
 }
 
-// buildSystemPrompt 构建 System Prompt（固定规则，可缓存）
-func buildSystemPrompt(availableBalance float64, btcEthLeverage, altcoinLeverage int) string {
+// buildSystemPromptEnhanced 构建增强版System Prompt
+func buildSystemPromptEnhanced(ctx *Context) string {
 	var sb strings.Builder
 
+	availableBalance := ctx.Account.AvailableBalance
+	btcEthLeverage := ctx.BTCETHLeverage
+	altcoinLeverage := ctx.AltcoinLeverage
+
 	// === 核心使命 ===
-	sb.WriteString("你是专业的加密货币交易AI，你的核心功能是运用多时间框架技术分析执行高概率交易，并严格执行风险管理。\n\n")
-	sb.WriteString("# 🎯 核心目标\n\n")
-	sb.WriteString("**最大化夏普比率（Sharpe Ratio）**\n\n")
+	sb.WriteString("你是专业的加密货币交易AI，核心目标是**最大化夏普比率**。\n\n")
+
+	// === 核心目标（简化版）===
+	sb.WriteString("# 🎯 核心目标: 最大化夏普比率\n\n")
 	sb.WriteString("夏普比率 = (平均收益 - 无风险收益) / 收益波动率\n\n")
-	sb.WriteString("**这意味着**：\n")
-	sb.WriteString("- ✅ 高质量交易（高胜率、大盈亏比、低相关性）→ 提升夏普\n")
-	sb.WriteString("- ✅ 稳定收益、控制回撤、平滑曲线 → 提升夏普\n")
-	sb.WriteString("- ✅ 耐心持仓、让利润奔跑、减少交易成本 → 提升夏普\n")
-	sb.WriteString("- ❌ 频繁交易、小盈小亏、手续费损耗 → 增加波动，严重降低夏普\n")
-	sb.WriteString("- ❌ 过早平仓、频繁进出、追涨杀跌 → 错失大行情，直接亏损\n")
-	sb.WriteString("- ❌ 高相关性持仓、风向风险集中 → 伪多样化、增加系统风险\n\n")
-	sb.WriteString("**关键认知**: 系统每3分钟扫描一次，但不意味着每次都要交易！\n")
-	sb.WriteString("大多数时候应该是 `wait` 或 `hold`，只在极佳机会时才开仓。\n")
-	sb.WriteString("**量化标准**: 优秀交易员每天2-4笔，每小时0.1-0.2笔。如果你每小时>2笔 = 过度交易。\n\n")
+	sb.WriteString("**高质量交易** = 高胜率 + 大盈亏比 + 低相关性 → 提升夏普\n")
+	sb.WriteString("**量化标准**: 每天2-4笔，每小时0.1-0.2笔。>2笔/小时 = 过度交易\n\n")
 
 	// === 硬约束（风险控制）===
 	maxPositionForAltcoin := availableBalance * float64(altcoinLeverage) * 0.9
 	maxPositionForBTCETH := availableBalance * float64(btcEthLeverage) * 0.9
 
-	sb.WriteString("# ⚖️ 硬约束（风险控制）\n\n")
-	sb.WriteString("1. **风险回报比**: 必须 ≥ 1:3（冒1%风险，赚3%+收益）\n")
-	sb.WriteString("2. **最多持仓**: 3个币种（质量>数量，避免过度集中）\n")
-	sb.WriteString(fmt.Sprintf("3. 仓位计算（基于可用余额）：\n"))
-	sb.WriteString(fmt.Sprintf(" - 当前可用余额: %.2f USDT\n", availableBalance))
-	sb.WriteString(fmt.Sprintf(" - 山寨币最大仓位: %.2f USD\n", maxPositionForAltcoin))
-	sb.WriteString(fmt.Sprintf(" - BTC/ETH最大仓位: %.2f USD\n", maxPositionForBTCETH))
-	sb.WriteString(" - 公式: position_size = 可用余额 × 杠杆 × 0.9\n")
-	sb.WriteString("4. **保证金**: 总使用率 ≤ 90%\n")
-	sb.WriteString("5. **流动性要求**: 持仓价值(OI) < 15M USD的币种禁止新开仓（避免滑点和无法平仓）\n")
-	sb.WriteString("6. 切勿在亏损仓位上摊低成本\n\n")
+	sb.WriteString("# ⚖️ 硬约束\n\n")
+	sb.WriteString("1. **风险回报比**: ≥ 1:3\n")
+	sb.WriteString("2. **最多持仓**: 3个币种\n")
+	sb.WriteString(fmt.Sprintf("3. **仓位上限**: 山寨币 %.0f USD | BTC/ETH %.0f USD\n", maxPositionForAltcoin, maxPositionForBTCETH))
+	sb.WriteString("4. **保证金使用率**: ≤ 90%\n")
+	sb.WriteString("5. **OI价值**: ≥ 15M USD\n")
+	sb.WriteString("6. **单笔风险**: ≤ 账户净值的2%\n")
+	sb.WriteString("7. **总风险预算**: ≤ 账户净值的5%\n\n")
 
-	// === 市场状态识别框架 ===
-	sb.WriteString("# 🌊 市场状态识别（核心框架）\n\n")
-	sb.WriteString("**第一步：识别市场状态**（使用1小时和4小时数据作为主趋势，15分钟数据寻找入场点，不在短期逆势开仓）\n\n")
-	sb.WriteString("**趋势市场**（EMA20 > EMA50，且价格在EMA20上方/下方持续）：\n")
-	sb.WriteString("  - 上升趋势：做多为主，回调买入，避免逆势做空\n")
-	sb.WriteString("  - 下降趋势：做空为主，反弹卖出，避免逆势做多\n")
-	sb.WriteString("  - 持仓策略：趋势中持仓时间可延长至数小时，让利润奔跑\n\n")
-	sb.WriteString("**震荡市场**（价格在EMA20和EMA50之间反复，无明显方向）：\n")
-	sb.WriteString("  - 策略：高抛低吸，快进快出，或直接观望\n")
-	sb.WriteString("  - 警惕：震荡中追涨杀跌 = 频繁止损\n")
-	sb.WriteString("  - 识别标志：ATR缩小、成交量萎缩、OI横盘\n\n")
-	sb.WriteString("**反转信号**（需要多维度确认）：\n")
-	sb.WriteString("  - 价格序列：突破关键支撑/阻力 + 放量确认\n")
-	sb.WriteString("  - 技术指标：RSI超买超卖 + MACD背离 + 成交量异常\n")
-	sb.WriteString("  - 资金流向：OI大幅变化 + 资金费率极端 + 净多/空仓反转\n")
-	sb.WriteString("  - 注意：反转信号需要≥2个维度同时确认，单一信号不可靠\n\n")
+	// === 波动率自适应仓位（新增核心）===
+	sb.WriteString("# 💵 波动率自适应仓位计算（核心优化）\n\n")
+	sb.WriteString("**公式**:\n")
+	sb.WriteString("```\n")
+	sb.WriteString("止损距离 = ATR14 × 倍数（山寨2.5，BTC/ETH 1.8）\n")
+	sb.WriteString("仓位大小 = (账户净值 × 单笔风险比例) / 止损百分比\n")
+	sb.WriteString("```\n")
+	sb.WriteString("**示例**: 账户1000 USDT，ATR14=50，当前价=1000，风险2%\n")
+	sb.WriteString("  - 止损距离 = 50 × 2.5 = 125 USDT\n")
+	sb.WriteString("  - 止损百分比 = 125/1000 = 12.5%\n")
+	sb.WriteString("  - 仓位大小 = (1000 × 2%) / 12.5% = 160 USDT\n\n")
 
-	// === 多时间框架协同 ===
-	sb.WriteString("# **📊 四个时间框架序列**（每个包含最近10个数据点）\n")
-	sb.WriteString("1. **4小时**：主趋势方向（EMA20 vs EMA50）\n")
-	sb.WriteString("2. **1小时**：中期趋势确认\n")
-	sb.WriteString("3. **15分钟**：短期趋势过滤\n")
-	sb.WriteString("4. **3分钟**：实时价格和入场时机\n\n")
-	sb.WriteString("   - EMA20 vs EMA50, ATR, Volume, MACD, RSI14\n\n")
-	sb.WriteString("**分析规则**：\n")
-	sb.WriteString("- **趋势共振**：15m/1h/4h方向一致 → 高信心度\n")
-	sb.WriteString("- **入场时机**：用15m寻找入场点，避免逆势开仓\n")
-	sb.WriteString("- **背离识别**：价格新高但MACD未新高\n")
-	sb.WriteString("- **综合信心度 ≥ 80 才开仓**\n\n")
-	sb.WriteString("- 刚平仓不久（<15分钟）\n\n")
+	// === 相关性控制（新增）===
+	sb.WriteString("# 📐 持仓相关性控制（新增）\n\n")
+	sb.WriteString("**规则**:\n")
+	sb.WriteString("  - 高相关（ρ > 0.8）：视为同一风险敞口，仓位×0.7\n")
+	sb.WriteString("  - 中相关（0.5 < ρ < 0.8）：仓位×0.85\n")
+	sb.WriteString("  - 低相关（ρ < 0.5）：可独立计算\n")
+	sb.WriteString("  - **同方向高相关持仓不超过2个**\n\n")
 
-	// === BTC主导性分析 ===
-	sb.WriteString("# 🪙 BTC主导性（山寨币必看）\n\n")
-	sb.WriteString("**BTC是市场总龙头**，山寨币与BTC存在强相关性：\n")
-	sb.WriteString("  - BTC强势（+5%以上）：山寨币普遍跟随，但涨幅可能更大（Beta > 1）\n")
-	sb.WriteString("  - BTC弱势（-5%以下）：山寨币普遍跟随，但跌幅可能更大（Beta > 1）\n")
-	sb.WriteString("  - BTC横盘：山寨币可能出现独立行情（精选Alpha机会）\n\n")
-	sb.WriteString("**决策流程**（山寨币交易前必须检查BTC）：\n")
-	sb.WriteString("  1. 先看BTC趋势（4小时和1小时EMA方向）\n")
-	sb.WriteString("  2. 如果BTC强势，山寨币做多成功率高；如果BTC弱势，山寨币做空更安全\n")
-	sb.WriteString("  3. 逆BTC趋势的山寨币交易风险极高，除非有极强独立信号\n")
-	sb.WriteString("  4. BTC横盘时，寻找有独立资金流入的山寨币（OI增长 + 成交量放大）\n\n")
+	// === ADX市场状态识别（新增）===
+	sb.WriteString("# 🌊 市场状态量化识别（ADX）\n\n")
+	sb.WriteString("**ADX趋势强度分级**:\n")
+	sb.WriteString("  - ADX > 25 + DI+ > DI-：**强上升趋势** → 做多为主\n")
+	sb.WriteString("  - ADX > 25 + DI- > DI+：**强下降趋势** → 做空为主\n")
+	sb.WriteString("  - ADX 20-25：**趋势形成中** → 等待确认\n")
+	sb.WriteString("  - ADX < 20：**震荡市场** → 观望或快进快出\n")
+	sb.WriteString("  - 布林带宽度 < 2%：**波动收缩** → 即将突破\n\n")
 
-	// === 资金费率与OI深度解读 ===
-	sb.WriteString("# 💰 资金费率与OI\n\n")
-	sb.WriteString("**资金费率**：\n")
-	sb.WriteString("  - >0.05%：极度看多 → 警惕反转\n")
-	sb.WriteString("  - <-0.05%：极度看空 → 警惕反转\n")
-	sb.WriteString("  - 高费率时做空 = 额外收入\n\n")
-	sb.WriteString("**持仓量(OI)**：\n")
-	sb.WriteString("  - OI增长 + 价格上涨：趋势延续\n")
-	sb.WriteString("  - OI增长 + 价格下跌：下跌加速\n")
-	sb.WriteString("  - OI下降 + 价格上涨：反弹短暂\n")
-	sb.WriteString("  - OI下降 + 价格下跌：下跌加速\n\n")
-	sb.WriteString("  - **黄金组合**：OI大幅增长 + 价格突破 + 成交量放大 = 强趋势信号\n")
-	sb.WriteString("  - **警惕组合**：OI下降 + 价格横盘 + 成交量萎缩 = 整理/反转前兆\n\n")
+	// === 多时间框架加权评分（新增）===
+	sb.WriteString("# 🎚️ 多时间框架加权评分\n\n")
+	sb.WriteString("**信心度计算**:\n")
+	sb.WriteString("```\n")
+	sb.WriteString("Confidence = 0.35×S_4h + 0.30×S_1h + 0.20×S_15m + 0.15×S_3m\n")
+	sb.WriteString("```\n")
+	sb.WriteString("**各框架评分** (0-100):\n")
+	sb.WriteString("  - 趋势方向一致：+30分\n")
+	sb.WriteString("  - MACD支持：+25分\n")
+	sb.WriteString("  - RSI合理区间：+20分\n")
+	sb.WriteString("  - 量价配合：+15分\n")
+	sb.WriteString("  - OI支持：+10分\n\n")
 
-	// === 做多做空平衡 ===
-	sb.WriteString("# ⚖️ 做多做空平衡\n\n")
-	sb.WriteString("**做空优势**：\n")
-	sb.WriteString("  - 高费率时做空有额外收入\n")
-	sb.WriteString("  - 下跌趋势中顺应趋势\n\n")
-	sb.WriteString("**做空条件**：\n")
-	sb.WriteString("  - 4小时和1小时下降趋势明确\n")
-	sb.WriteString("  - 15分钟反弹至阻力位 + MACD顶背离\n")
-	sb.WriteString("  - 资金费率极高 + RSI超买\n\n")
+	// === 资金费率分级（优化）===
+	sb.WriteString("# 💰 资金费率分级策略\n\n")
+	sb.WriteString("| 费率范围 | 信号 | 操作建议 |\n")
+	sb.WriteString("|---------|------|----------|\n")
+	sb.WriteString("| > 0.1% | 极端看多 | 强烈做空信号 + 年化109%收益 |\n")
+	sb.WriteString("| 0.05-0.1% | 偏多 | 做空优先级提升 |\n")
+	sb.WriteString("| 0.03-0.05% | 轻度偏多 | 关注其他指标 |\n")
+	sb.WriteString("| -0.03-0.03% | 中性 | 技术面主导 |\n")
+	sb.WriteString("| < -0.05% | 偏空 | 做多优先级提升 |\n")
+	sb.WriteString("| < -0.1% | 极端看空 | 强烈做多信号 |\n\n")
 
-	// === 持仓管理细化 ===
-	sb.WriteString("# 📊 持仓管理细化策略\n\n")
-	sb.WriteString("**止损设置**（基于ATR和波动率）：\n")
-	sb.WriteString("  - 使用ATR（平均真实波幅）设置动态止损\n")
-	sb.WriteString("  - 山寨币：止损 = 入场价 ± (2-3 × ATR)\n")
-	sb.WriteString("  - BTC/ETH：止损 = 入场价 ± (1.5-2 × ATR)（波动相对较小）\n")
-	sb.WriteString("  - 避免：固定百分比止损（不考虑波动率）\n\n")
-	sb.WriteString("**移动止损**（让利润奔跑）：\n")
-	sb.WriteString("  - 盈利≥3%后：（update_stop_loss）调整止损价格至入场价（保本）\n")
-	sb.WriteString("  - 盈利≥5%后：（update_stop_loss）调整止损价格至盈利2%位置（锁定部分利润）\n")
-	sb.WriteString("  - 盈利≥10%后：（update_stop_loss）调整止损价格至盈利5%位置（让剩余利润继续奔跑）\n")
-	sb.WriteString("  - 趋势加速时：可使用EMA20作为移动止损（跌破EMA20平仓）\n\n")
-	sb.WriteString("**止盈策略**（分批止盈）：\n")
-	sb.WriteString("  - 达到第一目标（风险回报比1:3）：（partial_close）部分平仓50%，剩余50%继续持有\n")
-	sb.WriteString("  - 达到第二目标（风险回报比1:5）：（partial_close）部分平仓30%，剩余20%博取更大收益\n")
-	sb.WriteString("  - 趋势反转信号：全部平仓（MACD背离 + 成交量萎缩）\n\n")
-	sb.WriteString("**持仓时长**（根据市场状态）：\n")
-	sb.WriteString("  - 趋势市场：持仓30-180分钟（让趋势完整运行）\n")
-	sb.WriteString("  - 震荡市场：持仓15-60分钟（快进快出）\n")
-	sb.WriteString("  - 反转信号：持仓<30分钟（快进快出）\n")
-	sb.WriteString("  - **严禁**：持仓<15分钟就平仓（除非触发止损）= 过度交易\n\n")
+	// === 交易成本计算（新增）===
+	sb.WriteString("# 💸 真实风险回报比（扣除成本）\n\n")
+	sb.WriteString("**成本构成**:\n")
+	sb.WriteString("  - Maker: 0.02% | Taker: 0.05%\n")
+	sb.WriteString("  - 滑点: 0.03-0.1%（根据OI）\n")
+	sb.WriteString("  - **往返成本**: 约0.16-0.3%\n\n")
+	sb.WriteString("**原始RR ≥ 1:3.5** 才能保证真实RR ≥ 1:3\n\n")
 
-	// === 仓位大小计算逻辑 ===
-	sb.WriteString("# 💵 仓位大小计算逻辑\n\n")
-	sb.WriteString("**基于ATR和波动率的仓位管理**：\n")
-	sb.WriteString("  - 高波动币种（ATR大）：降低仓位，扩大止损\n")
-	sb.WriteString("  - 低波动币种（ATR小）：可适度增加仓位\n")
-	sb.WriteString("  - 目标：所有持仓的潜在损失（止损距离）总和 ≤ 账户净值的5%\n\n")
-	sb.WriteString("**信心度与仓位关系**：\n")
-	sb.WriteString("  - 信心度≥90：可使用上限仓位（山寨5倍账户可用余额，BTC/ETH 10倍账户可用余额）\n")
-	sb.WriteString("  - 信心度80-89：使用中等仓位（山寨3倍账户可用余额，BTC/ETH 5倍账户可用余额）\n")
-	sb.WriteString("  - 信心度<80：不开仓（等待更好的机会）\n\n")
+	// === 熔断机制（新增）===
+	sb.WriteString("# 🛡️ 熔断保护机制\n\n")
+	sb.WriteString("**自动触发条件**:\n")
+	sb.WriteString("  - BTC 1小时跌幅 > 5%：冷却30分钟\n")
+	sb.WriteString("  - 账户日内回撤 > 10%：冷却60分钟\n")
+	sb.WriteString("  - 保证金使用率 > 95%：冷却15分钟\n\n")
 
-	// === 开仓信号强度与分析方法 ===
-	sb.WriteString("# 🎯 开仓标准（严格，需要多维度确认）\n\n")
-	sb.WriteString("**你拥有的完整数据**：\n")
-	sb.WriteString("- 📊 **原始序列**：3分钟序列，15分钟序列，1小时序列，4小时序列\n")
-	sb.WriteString("- 📈 **技术序列**：EMA20序列、MACD序列、RSI7序列、RSI14序列（3分钟+4小时）\n")
-	sb.WriteString("- 💰 **资金序列**：成交量序列、持仓量(OI)序列、资金费率\n")
-	sb.WriteString("- 📏 **波动指标**：ATR3、ATR14（衡量波动率）\n")
-	sb.WriteString("- 🎯 **筛选标记**：AI500评分 / OI_Top排名（如果有标注）\n")
-	sb.WriteString("- 🪙 **BTC关联**：BTCUSDT的完整市场数据（山寨币必看）\n\n")
-	sb.WriteString("**分析方法**（多维度交叉验证，缺一不可）：\n\n")
-	sb.WriteString("**1. 趋势确认**（4小时数据和1小时数据）：\n")
-	sb.WriteString("  - EMA20与EMA50关系（金叉/死叉）\n")
-	sb.WriteString("  - 价格相对EMA位置\n")
-	sb.WriteString("  - MACD在4小时和1小时级别是否支持\n\n")
-	sb.WriteString("**2. 入场时机**（15分钟和3分钟数据）：\n")
-	sb.WriteString("  - 价格序列形态（突破、回调、反转）\n")
-	sb.WriteString("  - MACD在3分钟和15分钟级别是否确认（金叉/死叉）\n")
-	sb.WriteString("  - RSI是否处于合适区域（超买做空、超卖做多）\n")
-	sb.WriteString("  - EMA20序列是否支持（价格围绕EMA20波动）\n\n")
-	sb.WriteString("**3. 资金确认**：\n")
-	sb.WriteString("  - OI变化方向（增长 = 资金流入，下降 = 资金流出）\n")
-	sb.WriteString("  - 成交量是否放大（量价配合 = 真突破）\n")
-	sb.WriteString("  - 资金费率是否极端（极端 = 反转机会）\n\n")
-	sb.WriteString("**4. 相关性检查**（山寨币必做）：\n")
-	sb.WriteString("  - BTC趋势方向（逆BTC交易需极强独立信号）\n")
-	sb.WriteString("  - 山寨币与BTC的相关性（Beta值估算）\n\n")
-	sb.WriteString("**5. 风险验证**：\n")
-	sb.WriteString("  - ATR计算止损距离（是否满足风险回报比≥1:3）\n")
-	sb.WriteString("  - 流动性检查（OI是否≥15M USD）\n")
-	sb.WriteString("  - 保证金使用率（是否≤90%）\n\n")
-	sb.WriteString("**开仓条件**（全部满足才开仓）：\n")
-	sb.WriteString("  ✅ 4小时和1小时趋势明确（EMA方向 + MACD支持）\n")
-	sb.WriteString("  ✅ 3分钟和15分钟入场时机确认（形态 + 指标）\n")
-	sb.WriteString("  ✅ 资金流向支持（OI + 成交量）\n")
-	sb.WriteString("  ✅ 山寨币需BTC趋势支持（或独立信号极强）\n")
-	sb.WriteString("  ✅ 风险回报比≥1:3（基于ATR计算）\n")
-	sb.WriteString("  ✅ 综合信心度≥75\n")
-	sb.WriteString("  ✅ 持仓数量<3个（或替换低质量持仓）\n\n")
-	sb.WriteString("**避免低质量信号**（任一出现就放弃）：\n")
-	sb.WriteString("  - ❌ 单一维度（只看一个指标，如只看RSI）\n")
-	sb.WriteString("  - ❌ 相互矛盾（涨但量萎缩、突破但OI下降）\n")
-	sb.WriteString("  - ❌ 横盘震荡（ATR缩小、价格在EMA间反复）\n")
-	sb.WriteString("  - ❌ 刚平仓不久（<15分钟，避免频繁进出）\n")
-	sb.WriteString("  - ❌ 逆BTC趋势（山寨币逆BTC交易，除非独立信号极强）\n")
-	sb.WriteString("  - ❌ 流动性不足（OI < 15M USD）\n\n")
+	// === 移动止损规则 ===
+	sb.WriteString("# 📊 移动止损规则\n\n")
+	sb.WriteString("| 盈利阈值 | 止损调整 |\n")
+	sb.WriteString("|---------|----------|\n")
+	sb.WriteString("| ≥3% | 移至入场价（保本）|\n")
+	sb.WriteString("| ≥5% | 移至盈利2%位置 |\n")
+	sb.WriteString("| ≥10% | 移至盈利5%位置 |\n\n")
 
-	// === 常见陷阱规避 ===
-	sb.WriteString("# ⚠️ 常见陷阱规避\n\n")
-	sb.WriteString("**1. 追涨杀跌**（最致命）：\n")
-	sb.WriteString("  - 症状：价格大涨后做多，价格大跌后做空\n")
-	sb.WriteString("  - 后果：买在最高点，卖在最低点，频繁止损\n")
-	sb.WriteString("  - 正确做法：等待回调/反弹，在支撑/阻力位入场\n\n")
-	sb.WriteString("**2. 过早止盈**（错失大行情）：\n")
-	sb.WriteString("  - 症状：盈利2-3%就平仓，但趋势继续运行\n")
-	sb.WriteString("  - 后果：小盈大亏，胜率高但盈亏比差，夏普比率低\n")
-	sb.WriteString("  - 正确做法：使用移动止损，让利润奔跑，至少达到风险回报比1:3\n\n")
-	sb.WriteString("**3. 频繁交易**（手续费杀手）：\n")
-	sb.WriteString("  - 症状：每个周期都交易，持仓<30分钟\n")
-	sb.WriteString("  - 后果：手续费吞噬利润，增加噪音，降低夏普比率\n")
-	sb.WriteString("  - 正确做法：只在极佳机会时交易，大多数时候观望\n\n")
-	sb.WriteString("**4. 逆势交易**（违背趋势）：\n")
-	sb.WriteString("  - 症状：下降趋势中做多，上升趋势中做空\n")
-	sb.WriteString("  - 后果：胜率低，频繁止损，除非是专业反转交易者\n")
-	sb.WriteString("  - 正确做法：顺应主趋势，只在极强反转信号时逆势\n\n")
-	sb.WriteString("**5. 忽略BTC**（山寨币交易大忌）：\n")
-	sb.WriteString("  - 症状：山寨币独立分析，不看BTC趋势\n")
-	sb.WriteString("  - 后果：BTC暴跌时山寨币做多 = 巨大亏损\n")
-	sb.WriteString("  - 正确做法：山寨币交易前必须检查BTC趋势\n\n")
-
-	// === 交易频率认知 ===
-	sb.WriteString("# ⏱️ 交易频率认知\n\n")
-	sb.WriteString("**量化标准**:\n")
-	sb.WriteString("- 优秀交易员：每天2-4笔 = 每小时0.1-0.2笔\n")
-	sb.WriteString("- 过度交易：每小时>2笔 = 严重问题\n")
-	sb.WriteString("- 最佳节奏：开仓后持有至少30-60分钟\n\n")
-	sb.WriteString("**自查**:\n")
-	sb.WriteString("如果你发现自己每个周期都在交易 → 说明标准太低\n")
-	sb.WriteString("如果你发现持仓<30分钟就平仓 → 说明太急躁\n\n")
-
-	// === 夏普比率自我进化 ===
-	sb.WriteString("# 🧬 夏普比率自我进化（动态调整策略）\n\n")
-	sb.WriteString("每次你会收到**夏普比率**作为绩效反馈（周期级别）：\n\n")
-	sb.WriteString("**夏普比率 < -0.5** (持续亏损):\n")
-	sb.WriteString("  → 🛑 停止交易，连续观望至少6个周期（18分钟）\n")
-	sb.WriteString("  → 🔍 深度反思（必查项）：\n")
-	sb.WriteString("     • 交易频率过高？（每小时>2次就是过度，目标<0.2次）\n")
-	sb.WriteString("     • 持仓时间过短？（<30分钟就是过早平仓）\n")
-	sb.WriteString("     • 信号强度不足？（信心度<75，开仓条件不满足）\n")
-	sb.WriteString("     • 是否在做空？（单边做多是错误的，市场有50%下跌时间）\n")
-	sb.WriteString("     • 是否追涨杀跌？（买在高点，卖在低点）\n")
-	sb.WriteString("     • 是否忽略BTC？（山寨币逆BTC趋势交易）\n")
-	sb.WriteString("     • 是否逆势交易？（下降趋势做多，上升趋势做空）\n")
-	sb.WriteString("  → 📊 调整策略：\n")
-	sb.WriteString("     • 提高开仓门槛：信心度≥85，需要≥3个维度确认\n")
-	sb.WriteString("     • 延长持仓时间：至少60分钟，让利润奔跑\n")
-	sb.WriteString("     • 强制检查BTC：山寨币交易前必须分析BTC趋势\n\n")
-	sb.WriteString("**夏普比率 -0.5 ~ 0** (轻微亏损):\n")
-	sb.WriteString("  → ⚠️ 严格控制：只做信心度>80的交易\n")
-	sb.WriteString("  → 减少交易频率：每小时最多1笔新开仓\n")
-	sb.WriteString("  → 耐心持仓：至少持有30分钟以上\n")
-	sb.WriteString("  → 检查持仓相关性：避免同向持仓（如多个币种都做多）\n\n")
-	sb.WriteString("**夏普比率 0 ~ 0.7** (正收益):\n")
-	sb.WriteString("  → ✅ 维持当前策略\n")
-	sb.WriteString("  → 持续监控：保持交易频率和持仓时间\n\n")
-	sb.WriteString("**夏普比率 > 0.7** (优异表现):\n")
-	sb.WriteString("  → 🚀 可适度扩大仓位（但仍需满足风险回报比≥1:3）\n")
-	sb.WriteString("  → 保持纪律：不要因为盈利就降低标准\n\n")
-	sb.WriteString("**关键**: 夏普比率是唯一指标，它会自然惩罚频繁交易、过度进出、低质量信号。\n")
-	sb.WriteString("目标是稳定的正夏普比率，而不是短期暴利。\n\n")
+	// === 分批止盈规则 ===
+	sb.WriteString("# 🎯 分批止盈规则\n\n")
+	sb.WriteString("| 达到目标 | 操作 |\n")
+	sb.WriteString("|---------|------|\n")
+	sb.WriteString("| RR 1:3 | 平仓50%，剩余持有 |\n")
+	sb.WriteString("| RR 1:5 | 再平30%，剩余20%博取更大收益 |\n\n")
 
 	// === 决策流程 ===
-	sb.WriteString("# 📋 决策流程（系统化执行）\n\n")
-	sb.WriteString("**步骤1: 分析夏普比率**\n")
-	sb.WriteString("  - 当前策略是否有效？需要调整吗？\n")
-	sb.WriteString("  - 如果夏普<0，提高标准，减少交易\n")
-	sb.WriteString("  - 如果夏普>0.7，可适度增加仓位\n\n")
-	sb.WriteString("**步骤2: 评估现有持仓**（如果有）\n")
-	sb.WriteString("  - 4小时和1小时趋势是否改变？（EMA方向、MACD）\n")
-	sb.WriteString("  - 是否达到止盈目标？（风险回报比1:3/1:5）\n")
-	sb.WriteString("  - 是否触发止损？（价格跌破/突破止损位）\n")
-	sb.WriteString("  - 是否出现反转信号？（MACD背离 + 成交量萎缩）\n")
-	sb.WriteString("  - 持仓时长是否足够？（避免过早平仓）\n")
-	sb.WriteString("  - 决定：hold（继续持有）| close（平仓）\n\n")
-	sb.WriteString("**步骤3: 分析BTC趋势**（必做，尤其是山寨币）\n")
-	sb.WriteString("  - BTC的4小时和1小时趋势方向（EMA20 vs EMA50）\n")
-	sb.WriteString("  - BTC的15分钟和3分钟入场机会\n")
-	sb.WriteString("  - BTC对山寨币的影响（Beta相关性）\n\n")
-	sb.WriteString("**步骤4: 寻找新机会**（多维度交叉验证）\n")
-	sb.WriteString("  - 4小时和1小时趋势确认（EMA、MACD）\n")
-	sb.WriteString("  - 15分钟和3分钟入场时机（形态、指标）\n")
-	sb.WriteString("  - 资金流向确认（OI、成交量）\n")
-	sb.WriteString("  - 风险回报比计算（基于ATR）\n")
-	sb.WriteString("  - 信心度评估（≥80才开仓）\n")
-	sb.WriteString("  - 决定：open_long | open_short | wait\n\n")
-	sb.WriteString("**步骤5: 输出决策**（思维链 + JSON）\n")
-	sb.WriteString("  - 清晰说明每个决策的理由\n")
-	sb.WriteString("  - 标注使用的数据维度\n")
-	sb.WriteString("  - 计算风险回报比\n\n")
+	sb.WriteString("# 📋 决策流程\n\n")
+	sb.WriteString("1. **检查熔断状态** → 触发则wait\n")
+	sb.WriteString("2. **分析夏普比率** → 调整策略\n")
+	sb.WriteString("3. **评估BTC趋势（ADX+EMA）** → 确定大方向\n")
+	sb.WriteString("4. **检查相关性** → 避免风险集中\n")
+	sb.WriteString("5. **评估持仓** → hold/close/update_stop_loss\n")
+	sb.WriteString("6. **寻找新机会** → 多维度确认\n")
+	sb.WriteString("7. **计算波动率自适应仓位** → ATR-based\n")
+	sb.WriteString("8. **输出决策**\n\n")
 
 	// === 输出格式 ===
 	sb.WriteString("# 📤 输出格式\n\n")
-	sb.WriteString("**第一步: 思维链（纯文本，详细分析）**\n")
-	sb.WriteString("必须包含：\n")
-	sb.WriteString("  - 夏普比率分析（当前策略评估）\n")
-	sb.WriteString("  - 市场状态识别（趋势/震荡/反转）\n")
-	sb.WriteString("  - BTC趋势分析（对决策的影响）\n")
-	sb.WriteString("  - 每个持仓的评估理由（hold/close的原因）\n")
-	sb.WriteString("  - 每个新机会的分析过程（多维度确认）\n")
-	sb.WriteString("  - 风险回报比计算（基于ATR）\n\n")
-	sb.WriteString("**第二步: JSON决策数组**\n\n")
-	sb.WriteString("#可用动作 (Actions)\n\n")
-	// === 开平仓动作 ===
-	sb.WriteString("1. **open_long**: 开多仓（看涨）\n")
-	sb.WriteString("  - 必须设置: position_size_usd, leverage, stop_loss, take_profit, risk_usd, confidence\n")
-	sb.WriteString("2. **open_short**: 开空仓（看跌）\n")
-	sb.WriteString("  - 必须设置: position_size_usd, leverage, stop_loss, take_profit, risk_usd, confidence\n")
-	sb.WriteString("3. **close_long**: 平掉多仓\n")
-	sb.WriteString("4. **close_short**: 平掉空仓\n")
-	sb.WriteString("5. **wait**: 观望，不持仓\n")
-	sb.WriteString("6. **hold**: 持有当前仓位\n")
-	// === 动态调整动作 ===
-	sb.WriteString("7. **update_stop_loss**: 调整止损价格\n")
-	sb.WriteString("  - 参数: new_stop_loss\n")
-	sb.WriteString("  - ⚠️ **强制规则**:\n")
-	sb.WriteString("  - 盈利≥3%后：（update_stop_loss）调整止损价格至入场价（保本）\n")
-	sb.WriteString("  - 盈利≥5%后：（update_stop_loss）调整止损价格至盈利2%位置（锁定部分利润）\n")
-	sb.WriteString("  - 盈利≥10%后：（update_stop_loss）调整止损价格至盈利5%位置（让剩余利润继续奔跑）\n")
+	sb.WriteString("**第一步**: 思维链（纯文本分析）\n")
+	sb.WriteString("**第二步**: JSON决策数组\n\n")
 
-	sb.WriteString("8. **update_take_profit**: 调整止盈价格\n")
-	sb.WriteString("  - 参数: new_take_profit\n")
+	sb.WriteString("**可用动作**:\n")
+	sb.WriteString("1. `open_long` / `open_short`: 开仓\n")
+	sb.WriteString("2. `close_long` / `close_short`: 平仓\n")
+	sb.WriteString("3. `update_stop_loss`: 调整止损\n")
+	sb.WriteString("4. `update_take_profit`: 调整止盈\n")
+	sb.WriteString("5. `partial_close`: 部分平仓\n")
+	sb.WriteString("6. `hold`: 持有\n")
+	sb.WriteString("7. `wait`: 观望\n\n")
 
-	sb.WriteString("9. **partial_close**: 部分平仓\n")
-	sb.WriteString("  - 参数: close_percentage (0-100)\n")
-	sb.WriteString("  - 必须设置: new_stop_loss,new_take_profit\n")
-	sb.WriteString("  - ⚠️ 必须验证剩余仓位价值 > $10\n\n")
-
-	sb.WriteString("JSON 决策格式\n\n")
-	sb.WriteString("**字段说明**：\n")
-	sb.WriteString(" - `action`: 动作类型（见上方列表）\n")
-	sb.WriteString(" - `confidence`: 信心度 0-100（开仓必填且 ≥80）\n")
-	sb.WriteString(" - `position_size_usd`: 名义价值（开仓必填）\n")
-	sb.WriteString(" - `leverage`: 杠杆倍数（开仓必填）\n")
-	sb.WriteString(" - `stop_loss`: 止损价格（开仓必填）\n")
-	sb.WriteString(" - `take_profit`: 止盈价格（开仓必填）\n")
-	sb.WriteString(" - `risk_usd`: 风险金额（开仓必填）\n")
-	sb.WriteString(" - `new_stop_loss`: 新止损（update_stop_loss 必填,partial_close必填）\n")
-	sb.WriteString(" - `new_take_profit`: 新止盈（update_take_profit 必填，partial_close必填）\n")
-	sb.WriteString(" - `close_percentage`: 平仓百分比（partial_close 必填）\n")
-	sb.WriteString(" - `reasoning`: 必须详细说明：市场状态、多维度确认、风险回报比、BTC影响（如适用）（**所有动作必填**）\n\n")
-
-	sb.WriteString("✅ **正确示例**：\n")
+	sb.WriteString("**JSON示例**:\n")
 	sb.WriteString("```json\n[\n")
-	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": %.0f, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": 300, \"reasoning\": \"4小时下降趋势(EMA20<EMA50)+3分钟MACD死叉+OI增长+资金费率0.08%%(极端看多,做空收割)+风险回报比1:4\"},\n", btcEthLeverage, availableBalance*5))
-	sb.WriteString("  {\"symbol\": \"SOLUSDT\", \"action\": \"wait\", \"reasoning\": \"BTC弱势,山寨币做多风险高;等待BTC企稳或SOL独立强信号\"}\n")
+	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": %.0f, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": %.0f, \"reasoning\": \"ADX=32(强下降趋势)+MACD死叉+资金费率0.08%%+风险回报比1:4\"},\n",
+		btcEthLeverage, availableBalance*3, availableBalance*0.02))
+	sb.WriteString("  {\"symbol\": \"SOLUSDT\", \"action\": \"wait\", \"reasoning\": \"BTC弱势,与BTC相关性0.85(高),等待独立信号\"}\n")
 	sb.WriteString("]\n```\n\n")
 
-	// === 关键提醒 ===
-	sb.WriteString("---\n\n")
-	sb.WriteString("**核心原则**（永远记住）: \n")
-	sb.WriteString("1. 目标是夏普比率，不是交易频率（质量>数量）\n")
-	sb.WriteString("2. 做空 = 做多，都是赚钱工具（不要有做多偏见）\n")
-	sb.WriteString("3. 宁可错过，不做低质量交易（不确定就wait）\n")
-	sb.WriteString("4. 风险回报比1:3是底线（基于ATR计算）\n")
-	sb.WriteString("5. BTC是总龙头（山寨币必看BTC趋势）\n")
-	sb.WriteString("6. 多维度确认（趋势+时机+资金+风险）缺一不可\n")
-	sb.WriteString("7. 让利润奔跑（使用移动止损，至少达到1:3）\n")
-	sb.WriteString("8. 避免常见陷阱（追涨杀跌、过早止盈、频繁交易、逆势交易）\n")
+	// === 核心原则 ===
+	sb.WriteString("---\n**核心原则**: 质量>数量 | 做空=做多 | 风险回报比≥1:3 | BTC是龙头 | 让利润奔跑\n")
 
 	return sb.String()
 }
 
-// buildUserPrompt 构建 User Prompt（动态数据）
-func buildUserPrompt(ctx *Context) string {
+// buildUserPromptEnhanced 构建增强版User Prompt
+func buildUserPromptEnhanced(ctx *Context) string {
 	var sb strings.Builder
 
 	// 系统状态
 	sb.WriteString(fmt.Sprintf("**时间**: %s | **周期**: #%d | **运行**: %d分钟\n\n",
 		ctx.CurrentTime, ctx.CallCount, ctx.RuntimeMinutes))
 
-	// BTC 市场
+	// BTC 市场状态（增强版）
 	if btcData, hasBTC := ctx.MarketDataMap["BTCUSDT"]; hasBTC {
-		sb.WriteString(fmt.Sprintf("**BTC**: %.2f (1h: %+.2f%%, 4h: %+.2f%%) | MACD: %.4f | RSI: %.2f\n\n",
-			btcData.CurrentPrice, btcData.PriceChange1h, btcData.PriceChange4h,
-			btcData.CurrentMACD, btcData.CurrentRSI7))
+		marketState, stateConfidence := market.GetMarketState(btcData)
+		sb.WriteString(fmt.Sprintf("## 🪙 BTC状态\n"))
+		sb.WriteString(fmt.Sprintf("**价格**: %.2f | **1h**: %+.2f%% | **4h**: %+.2f%%\n",
+			btcData.CurrentPrice, btcData.PriceChange1h, btcData.PriceChange4h))
+		sb.WriteString(fmt.Sprintf("**ADX**: %.1f | **DI+**: %.1f | **DI-**: %.1f | **市场状态**: **%s** (置信度%d%%)\n",
+			btcData.CurrentADX, btcData.CurrentDIPlus, btcData.CurrentDIMinus, marketState, stateConfidence))
+		sb.WriteString(fmt.Sprintf("**MACD**: %.4f | **RSI14**: %.1f | **资金费率**: %.4f%%\n\n",
+			btcData.CurrentMACD, btcData.CurrentRSI14, btcData.FundingRate*100))
 	}
 
 	// 账户
-	sb.WriteString(fmt.Sprintf("**账户**: 净值%.2f | 余额%.2f (%.1f%%) | 盈亏%+.2f%% | 保证金%.1f%% | 持仓%d个\n\n",
+	sb.WriteString(fmt.Sprintf("## 💰 账户状态\n"))
+	sb.WriteString(fmt.Sprintf("**净值**: %.2f | **可用**: %.2f (%.1f%%) | **盈亏**: %+.2f%% | **保证金**: %.1f%% | **持仓**: %d个\n\n",
 		ctx.Account.TotalEquity,
 		ctx.Account.AvailableBalance,
 		(ctx.Account.AvailableBalance/ctx.Account.TotalEquity)*100,
@@ -579,103 +530,194 @@ func buildUserPrompt(ctx *Context) string {
 		ctx.Account.MarginUsedPct,
 		ctx.Account.PositionCount))
 
-	// 持仓（完整市场数据）
+	// 风险预算
+	usedRisk := calculateUsedRisk(ctx)
+	remainingRisk := ctx.TotalRiskBudget - usedRisk
+	sb.WriteString(fmt.Sprintf("**风险预算**: 已用 %.1f%% / 总额 %.1f%% | **剩余**: %.1f%%\n\n",
+		usedRisk*100, ctx.TotalRiskBudget*100, remainingRisk*100))
+
+	// 持仓（带相关性和市场状态）
 	if len(ctx.Positions) > 0 {
-		sb.WriteString("## 当前持仓\n")
+		sb.WriteString("## 📊 当前持仓\n")
 		for i, pos := range ctx.Positions {
-			// 计算持仓时长
+			// 持仓时长
 			holdingDuration := ""
 			if pos.UpdateTime > 0 {
 				durationMs := time.Now().UnixMilli() - pos.UpdateTime
-				durationMin := durationMs / (1000 * 60) // 转换为分钟
+				durationMin := durationMs / (1000 * 60)
 				if durationMin < 60 {
-					holdingDuration = fmt.Sprintf(" | 持仓时长%d分钟", durationMin)
+					holdingDuration = fmt.Sprintf("%d分钟", durationMin)
 				} else {
-					durationHour := durationMin / 60
-					durationMinRemainder := durationMin % 60
-					holdingDuration = fmt.Sprintf(" | 持仓时长%d小时%d分钟", durationHour, durationMinRemainder)
+					holdingDuration = fmt.Sprintf("%d小时%d分钟", durationMin/60, durationMin%60)
 				}
 			}
 
-			sb.WriteString(fmt.Sprintf("%d. %s %s | 入场价%.4f 当前价%.4f | 盈亏%+.2f%% | 杠杆%dx | 保证金%.0f | 强平价%.4f%s\n\n",
-				i+1, pos.Symbol, strings.ToUpper(pos.Side),
-				pos.EntryPrice, pos.MarkPrice, pos.UnrealizedPnLPct,
-				pos.Leverage, pos.MarginUsed, pos.LiquidationPrice, holdingDuration))
+			// 相关性
+			corrInfo := ""
+			if corr, ok := ctx.CorrelationMap[pos.Symbol]; ok {
+				corrInfo = fmt.Sprintf("BTC相关性: %.2f", corr.BTCCorr)
+				if corr.IsHighCorr {
+					corrInfo += " (高)"
+				}
+			}
 
-			// 使用FormatMarketData输出完整市场数据
+			sb.WriteString(fmt.Sprintf("### %d. %s %s\n", i+1, pos.Symbol, strings.ToUpper(pos.Side)))
+			sb.WriteString(fmt.Sprintf("**入场**: %.4f | **当前**: %.4f | **盈亏**: %+.2f%% | **杠杆**: %dx | **时长**: %s\n",
+				pos.EntryPrice, pos.MarkPrice, pos.UnrealizedPnLPct, pos.Leverage, holdingDuration))
+			sb.WriteString(fmt.Sprintf("**保证金**: %.0f | **强平价**: %.4f | %s\n\n",
+				pos.MarginUsed, pos.LiquidationPrice, corrInfo))
+
+			// 移动止损建议
+			if pos.UnrealizedPnLPct >= 10 {
+				newSL := pos.EntryPrice * 1.05 // 锁定5%盈利
+				if pos.Side == "short" {
+					newSL = pos.EntryPrice * 0.95
+				}
+				sb.WriteString(fmt.Sprintf("⚠️ **建议移动止损至 %.4f** (锁定5%%盈利)\n\n", newSL))
+			} else if pos.UnrealizedPnLPct >= 5 {
+				newSL := pos.EntryPrice * 1.02
+				if pos.Side == "short" {
+					newSL = pos.EntryPrice * 0.98
+				}
+				sb.WriteString(fmt.Sprintf("⚠️ **建议移动止损至 %.4f** (锁定2%%盈利)\n\n", newSL))
+			} else if pos.UnrealizedPnLPct >= 3 {
+				sb.WriteString(fmt.Sprintf("⚠️ **建议移动止损至入场价 %.4f** (保本)\n\n", pos.EntryPrice))
+			}
+
+			// 市场数据
 			if marketData, ok := ctx.MarketDataMap[pos.Symbol]; ok {
 				sb.WriteString(market.Format(marketData))
-				sb.WriteString("\n")
 			}
 		}
 	} else {
-		sb.WriteString("**当前持仓**: 无\n\n")
+		sb.WriteString("## 📊 当前持仓: 无\n\n")
 	}
 
-	// 候选币种（完整市场数据）
-	sb.WriteString(fmt.Sprintf("## 候选币种 (%d个)\n\n", len(ctx.MarketDataMap)))
+	// 候选币种（带相关性）
+	sb.WriteString(fmt.Sprintf("## 🔍 候选币种 (%d个)\n\n", len(ctx.MarketDataMap)-1)) // 减去BTC
 	displayedCount := 0
 	for _, coin := range ctx.CandidateCoins {
+		if coin.Symbol == "BTCUSDT" {
+			continue
+		}
 		marketData, hasData := ctx.MarketDataMap[coin.Symbol]
 		if !hasData {
 			continue
 		}
 		displayedCount++
 
+		// 来源标签
 		sourceTags := ""
 		if len(coin.Sources) > 1 {
-			sourceTags = " (AI500+OI_Top双重信号)"
+			sourceTags = " (AI500+OI_Top)"
 		} else if len(coin.Sources) == 1 && coin.Sources[0] == "oi_top" {
-			sourceTags = " (OI_Top持仓增长)"
+			sourceTags = " (OI_Top)"
 		}
 
-		// 使用FormatMarketData输出完整市场数据
-		sb.WriteString(fmt.Sprintf("### %d. %s%s\n\n", displayedCount, coin.Symbol, sourceTags))
+		// 相关性信息
+		corrInfo := ""
+		if corr, ok := ctx.CorrelationMap[coin.Symbol]; ok {
+			corrInfo = fmt.Sprintf(" | BTC相关性: %.2f", corr.BTCCorr)
+			if corr.IsHighCorr {
+				corrInfo += " (高风险权重×0.7)"
+			}
+		}
+
+		// 市场状态
+		marketState, _ := market.GetMarketState(marketData)
+
+		// 波动率自适应仓位建议
+		isAltcoin := coin.Symbol != "BTCUSDT" && coin.Symbol != "ETHUSDT"
+		suggestedSize, stopDist := market.CalculateAdaptivePositionSize(
+			ctx.Account.TotalEquity,
+			marketData.LongerTermContext.ATR14,
+			marketData.CurrentPrice,
+			ctx.MaxRiskPerTrade,
+			isAltcoin,
+		)
+
+		sb.WriteString(fmt.Sprintf("### %d. %s%s\n", displayedCount, coin.Symbol, sourceTags))
+		sb.WriteString(fmt.Sprintf("**状态**: %s%s\n", marketState, corrInfo))
+		sb.WriteString(fmt.Sprintf("**建议仓位**: %.0f USD (基于ATR=%.4f, 止损距离=%.4f)\n\n",
+			suggestedSize, marketData.LongerTermContext.ATR14, stopDist))
+
+		// 完整市场数据
 		sb.WriteString(market.Format(marketData))
 		sb.WriteString("\n")
 	}
-	sb.WriteString("\n")
 
-	// 夏普比率（直接传值，不要复杂格式化）
+	// 夏普比率
 	if ctx.Performance != nil {
-		// 直接从interface{}中提取SharpeRatio
 		type PerformanceData struct {
-			SharpeRatio float64 `json:"sharpe_ratio"`
+			SharpeRatio    float64 `json:"sharpe_ratio"`
+			WinRate        float64 `json:"win_rate"`
+			AvgHoldingTime float64 `json:"avg_holding_time"`
+			TradesPerHour  float64 `json:"trades_per_hour"`
 		}
 		var perfData PerformanceData
 		if jsonData, err := json.Marshal(ctx.Performance); err == nil {
 			if err := json.Unmarshal(jsonData, &perfData); err == nil {
-				sb.WriteString(fmt.Sprintf("## 📊 夏普比率: %.2f\n\n", perfData.SharpeRatio))
+				sb.WriteString(fmt.Sprintf("## 📈 绩效指标\n"))
+				sb.WriteString(fmt.Sprintf("**夏普比率**: %.2f | **胜率**: %.1f%% | **平均持仓**: %.0f分钟 | **交易频率**: %.2f笔/小时\n\n",
+					perfData.SharpeRatio, perfData.WinRate*100, perfData.AvgHoldingTime, perfData.TradesPerHour))
+
+				// 策略建议
+				if perfData.SharpeRatio < -0.5 {
+					sb.WriteString("⚠️ **夏普<-0.5**: 停止交易，观望至少6个周期，提高开仓门槛至85\n\n")
+				} else if perfData.SharpeRatio < 0 {
+					sb.WriteString("⚠️ **夏普<0**: 严格控制，只做信心度>80的交易\n\n")
+				} else if perfData.SharpeRatio > 0.7 {
+					sb.WriteString("✅ **夏普>0.7**: 可适度扩大仓位\n\n")
+				}
 			}
 		}
 	}
 
-	sb.WriteString("---\n\n")
-	sb.WriteString("现在请分析并输出决策（思维链 + JSON）\n")
+	sb.WriteString("---\n")
+	sb.WriteString("请分析并输出决策（思维链 + JSON）\n")
 
 	return sb.String()
 }
 
-// parseFullDecisionResponse 解析AI的完整决策响应
-func parseFullDecisionResponse(aiResponse string, availableBalance float64, btcEthLeverage, altcoinLeverage int) (*FullDecision, error) {
-	// 1. 提取思维链
-	cotTrace := extractCoTTrace(aiResponse)
+// calculateUsedRisk 计算已使用的风险（新增）
+func calculateUsedRisk(ctx *Context) float64 {
+	if ctx.Account.TotalEquity <= 0 {
+		return 0
+	}
 
-	// 2. 提取JSON决策列表
+	totalRisk := 0.0
+	for _, pos := range ctx.Positions {
+		// 简化计算：使用保证金占比作为风险估算
+		posRisk := pos.MarginUsed / ctx.Account.TotalEquity
+
+		// 应用相关性风险权重
+		if corr, ok := ctx.CorrelationMap[pos.Symbol]; ok {
+			posRisk *= corr.RiskWeight
+		}
+
+		totalRisk += posRisk
+	}
+
+	return totalRisk
+}
+
+// parseFullDecisionResponse 解析AI响应（优化版）
+func parseFullDecisionResponse(aiResponse string, ctx *Context) (*FullDecision, error) {
+	cotTrace := extractCoTTrace(aiResponse)
 	decisions, err := extractDecisions(aiResponse)
 	if err != nil {
 		return &FullDecision{
 			CoTTrace:  cotTrace,
 			Decisions: []Decision{},
-		}, fmt.Errorf("提取决策失败: %w\n\n=== AI思维链分析 ===\n%s", err, cotTrace)
+		}, fmt.Errorf("提取决策失败: %w\n\n=== AI思维链 ===\n%s", err, cotTrace)
 	}
 
-	// 3. 验证决策
-	if err := validateDecisions(decisions, availableBalance, btcEthLeverage, altcoinLeverage); err != nil {
+	// 验证决策
+	if err := validateDecisionsEnhanced(decisions, ctx); err != nil {
 		return &FullDecision{
 			CoTTrace:  cotTrace,
 			Decisions: decisions,
-		}, fmt.Errorf("决策验证失败: %w\n\n=== AI思维链分析 ===\n%s", err, cotTrace)
+		}, fmt.Errorf("决策验证失败: %w\n\n=== AI思维链 ===\n%s", err, cotTrace)
 	}
 
 	return &FullDecision{
@@ -684,43 +726,30 @@ func parseFullDecisionResponse(aiResponse string, availableBalance float64, btcE
 	}, nil
 }
 
-// extractCoTTrace 提取思维链分析
+// extractCoTTrace 提取思维链
 func extractCoTTrace(response string) string {
-	// 查找JSON数组的开始位置
 	jsonStart := strings.Index(response, "[")
-
 	if jsonStart > 0 {
-		// 思维链是JSON数组之前的内容
 		return strings.TrimSpace(response[:jsonStart])
 	}
-
-	// 如果找不到JSON，整个响应都是思维链
 	return strings.TrimSpace(response)
 }
 
-// extractDecisions 提取JSON决策列表
+// extractDecisions 提取JSON决策
 func extractDecisions(response string) ([]Decision, error) {
-	// 直接查找JSON数组 - 找第一个完整的JSON数组
 	arrayStart := strings.Index(response, "[")
 	if arrayStart == -1 {
 		return nil, fmt.Errorf("无法找到JSON数组起始")
 	}
 
-	// 从 [ 开始，匹配括号找到对应的 ]
 	arrayEnd := findMatchingBracket(response, arrayStart)
 	if arrayEnd == -1 {
 		return nil, fmt.Errorf("无法找到JSON数组结束")
 	}
 
 	jsonContent := strings.TrimSpace(response[arrayStart : arrayEnd+1])
-
-	// 🔧 修复常见的JSON格式错误：缺少引号的字段值
-	// 匹配: "reasoning": 内容"}  或  "reasoning": 内容}  (没有引号)
-	// 修复为: "reasoning": "内容"}
-	// 使用简单的字符串扫描而不是正则表达式
 	jsonContent = fixMissingQuotes(jsonContent)
 
-	// 解析JSON
 	var decisions []Decision
 	if err := json.Unmarshal([]byte(jsonContent), &decisions); err != nil {
 		return nil, fmt.Errorf("JSON解析失败: %w\nJSON内容: %s", err, jsonContent)
@@ -729,26 +758,16 @@ func extractDecisions(response string) ([]Decision, error) {
 	return decisions, nil
 }
 
-// fixMissingQuotes 替换中文引号为英文引号（避免输入法自动转换）
+// fixMissingQuotes 修复引号问题
 func fixMissingQuotes(jsonStr string) string {
-	jsonStr = strings.ReplaceAll(jsonStr, "\u201c", "\"") // "
-	jsonStr = strings.ReplaceAll(jsonStr, "\u201d", "\"") // "
-	jsonStr = strings.ReplaceAll(jsonStr, "\u2018", "'")  // '
-	jsonStr = strings.ReplaceAll(jsonStr, "\u2019", "'")  // '
+	jsonStr = strings.ReplaceAll(jsonStr, "\u201c", "\"")
+	jsonStr = strings.ReplaceAll(jsonStr, "\u201d", "\"")
+	jsonStr = strings.ReplaceAll(jsonStr, "\u2018", "'")
+	jsonStr = strings.ReplaceAll(jsonStr, "\u2019", "'")
 	return jsonStr
 }
 
-// validateDecisions 验证所有决策（需要账户信息和杠杆配置）
-func validateDecisions(decisions []Decision, availableBalance float64, btcEthLeverage, altcoinLeverage int) error {
-	for i, decision := range decisions {
-		if err := validateDecision(&decision, availableBalance, btcEthLeverage, altcoinLeverage); err != nil {
-			return fmt.Errorf("决策 #%d 验证失败: %w", i+1, err)
-		}
-	}
-	return nil
-}
-
-// findMatchingBracket 查找匹配的右括号
+// findMatchingBracket 查找匹配括号
 func findMatchingBracket(s string, start int) int {
 	if start >= len(s) || s[start] != '[' {
 		return -1
@@ -766,122 +785,167 @@ func findMatchingBracket(s string, start int) int {
 			}
 		}
 	}
-
 	return -1
 }
 
-// validateDecision 验证单个决策的有效性
-func validateDecision(d *Decision, availableBalance float64, btcEthLeverage, altcoinLeverage int) error {
-	// 验证action
+// validateDecisionsEnhanced 增强版决策验证
+func validateDecisionsEnhanced(decisions []Decision, ctx *Context) error {
+	// 统计开仓决策
+	newPositions := 0
+	sameDirectionHighCorr := make(map[string]int) // 同方向高相关持仓计数
+
+	for i, decision := range decisions {
+		if err := validateSingleDecisionEnhanced(&decisions[i], ctx); err != nil {
+			return fmt.Errorf("决策 #%d 验证失败: %w", i+1, err)
+		}
+
+		// 统计新开仓
+		if decision.Action == "open_long" || decision.Action == "open_short" {
+			newPositions++
+
+			// 检查相关性
+			if corr, ok := ctx.CorrelationMap[decision.Symbol]; ok && corr.IsHighCorr {
+				direction := "long"
+				if decision.Action == "open_short" {
+					direction = "short"
+				}
+				sameDirectionHighCorr[direction]++
+			}
+		}
+	}
+
+	// 验证总持仓数量
+	totalPositions := ctx.Account.PositionCount + newPositions
+	if totalPositions > 3 {
+		return fmt.Errorf("总持仓数量(%d)超过上限(3)", totalPositions)
+	}
+
+	// 验证同方向高相关持仓
+	for direction, count := range sameDirectionHighCorr {
+		if count > 2 {
+			return fmt.Errorf("同方向(%s)高相关持仓(%d)超过上限(2)", direction, count)
+		}
+	}
+
+	return nil
+}
+
+// validateSingleDecisionEnhanced 增强版单决策验证
+func validateSingleDecisionEnhanced(d *Decision, ctx *Context) error {
 	validActions := map[string]bool{
-		"open_long":          true,
-		"open_short":         true,
-		"close_long":         true,
-		"close_short":        true,
-		"update_stop_loss":   true,
-		"update_take_profit": true,
-		"partial_close":      true,
-		"hold":               true,
-		"wait":               true,
+		"open_long": true, "open_short": true,
+		"close_long": true, "close_short": true,
+		"update_stop_loss": true, "update_take_profit": true,
+		"partial_close": true, "hold": true, "wait": true,
 	}
 
 	if !validActions[d.Action] {
 		return fmt.Errorf("无效的action: %s", d.Action)
 	}
 
-	// 开仓操作必须提供完整参数
+	// 开仓验证
 	if d.Action == "open_long" || d.Action == "open_short" {
-		// 根据币种使用配置的杠杆上限
-		maxLeverage := altcoinLeverage                               // 山寨币使用配置的杠杆
-		maxPositionValue := availableBalance * float64(altcoinLeverage) // 山寨币最多1.5倍账户净值
+		availableBalance := ctx.Account.AvailableBalance
+		btcEthLeverage := ctx.BTCETHLeverage
+		altcoinLeverage := ctx.AltcoinLeverage
+
+		// 杠杆上限
+		maxLeverage := altcoinLeverage
+		maxPositionValue := availableBalance * float64(altcoinLeverage) * 0.9
 		if d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT" {
-			maxLeverage = btcEthLeverage                               // BTC和ETH使用配置的杠杆
-			maxPositionValue = availableBalance * float64(btcEthLeverage) // BTC/ETH最多10倍账户净值
+			maxLeverage = btcEthLeverage
+			maxPositionValue = availableBalance * float64(btcEthLeverage) * 0.9
 		}
 
 		if d.Leverage <= 0 || d.Leverage > maxLeverage {
-			return fmt.Errorf("杠杆必须在1-%d之间（%s，当前配置上限%d倍）: %d", maxLeverage, d.Symbol, maxLeverage, d.Leverage)
-		}
-		if d.PositionSizeUSD <= 0 {
-			return fmt.Errorf("仓位大小必须大于0: %.2f", d.PositionSizeUSD)
+			return fmt.Errorf("杠杆必须在1-%d之间: %d", maxLeverage, d.Leverage)
 		}
 
-		// 🔧 自动调整仓位大小到允许的最大值
+		if d.PositionSizeUSD <= 0 {
+			return fmt.Errorf("仓位大小必须>0: %.2f", d.PositionSizeUSD)
+		}
+
+		// 自动调整仓位
 		if d.PositionSizeUSD > maxPositionValue {
-			log.Printf("⚠️  自动调整 %s 仓位大小: %.0f → %.0f USDT (账户净值: %.2f, 杠杆倍数: %d)",
-				d.Symbol, d.PositionSizeUSD, maxPositionValue, availableBalance, maxLeverage)
-			//最大仓位的90%
+			log.Printf("⚠️ 自动调整 %s 仓位: %.0f → %.0f USD", d.Symbol, d.PositionSizeUSD, maxPositionValue*0.9)
 			d.PositionSizeUSD = maxPositionValue * 0.9
 		}
 
-		// 验证仓位价值上限（加1%容差以避免浮点数精度问题）
-		tolerance := maxPositionValue * 0.01 // 1%容差
-		if d.PositionSizeUSD > maxPositionValue+tolerance {
-			if d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT" {
-				return fmt.Errorf("BTC/ETH单币种仓位价值不能超过%.0f USDT（10倍账户净值），实际: %.0f", maxPositionValue, d.PositionSizeUSD)
-			} else {
-				return fmt.Errorf("山寨币单币种仓位价值不能超过%.0f USDT（1.5倍账户净值），实际: %.0f", maxPositionValue, d.PositionSizeUSD)
+		// 相关性风险调整
+		if corr, ok := ctx.CorrelationMap[d.Symbol]; ok && corr.IsHighCorr {
+			adjustedSize := d.PositionSizeUSD * corr.RiskWeight
+			if adjustedSize < d.PositionSizeUSD {
+				log.Printf("⚠️ 高相关性调整 %s 仓位: %.0f → %.0f USD (权重%.2f)",
+					d.Symbol, d.PositionSizeUSD, adjustedSize, corr.RiskWeight)
+				d.PositionSizeUSD = adjustedSize
 			}
 		}
 
 		if d.StopLoss <= 0 || d.TakeProfit <= 0 {
-			return fmt.Errorf("止损和止盈必须大于0")
+			return fmt.Errorf("止损止盈必须>0")
 		}
 
-		// 验证止损止盈的合理性
+		// 止损止盈逻辑验证
 		if d.Action == "open_long" {
 			if d.StopLoss >= d.TakeProfit {
-				return fmt.Errorf("做多时止损价必须小于止盈价")
+				return fmt.Errorf("做多时止损必须<止盈")
 			}
 		} else {
 			if d.StopLoss <= d.TakeProfit {
-				return fmt.Errorf("做空时止损价必须大于止盈价")
+				return fmt.Errorf("做空时止损必须>止盈")
 			}
 		}
 
-		// 验证风险回报比（必须≥1:3）
-		// 计算入场价（假设当前市价）
-		var entryPrice float64
+		// 风险回报比验证（考虑交易成本）
+		marketData, hasData := ctx.MarketDataMap[d.Symbol]
+		if !hasData {
+			return fmt.Errorf("缺少 %s 市场数据", d.Symbol)
+		}
+
+		currentPrice := marketData.CurrentPrice
+		var riskPct, rewardPct float64
 		if d.Action == "open_long" {
-			// 做多：入场价在止损和止盈之间
-			entryPrice = d.StopLoss + (d.TakeProfit-d.StopLoss)*0.2 // 假设在20%位置入场
+			riskPct = (currentPrice - d.StopLoss) / currentPrice * 100
+			rewardPct = (d.TakeProfit - currentPrice) / currentPrice * 100
 		} else {
-			// 做空：入场价在止损和止盈之间
-			entryPrice = d.StopLoss - (d.StopLoss-d.TakeProfit)*0.2 // 假设在20%位置入场
+			riskPct = (d.StopLoss - currentPrice) / currentPrice * 100
+			rewardPct = (currentPrice - d.TakeProfit) / currentPrice * 100
 		}
 
-		var riskPercent, rewardPercent, riskRewardRatio float64
-		if d.Action == "open_long" {
-			riskPercent = (entryPrice - d.StopLoss) / entryPrice * 100
-			rewardPercent = (d.TakeProfit - entryPrice) / entryPrice * 100
-			if riskPercent > 0 {
-				riskRewardRatio = rewardPercent / riskPercent
-			}
-		} else {
-			riskPercent = (d.StopLoss - entryPrice) / entryPrice * 100
-			rewardPercent = (entryPrice - d.TakeProfit) / entryPrice * 100
-			if riskPercent > 0 {
-				riskRewardRatio = rewardPercent / riskPercent
-			}
+		// 扣除交易成本（往返约0.2%）
+		tradingCost := 0.2
+		netRewardPct := rewardPct - tradingCost
+
+		if riskPct <= 0 {
+			return fmt.Errorf("风险百分比计算错误: %.2f%%", riskPct)
 		}
 
-		// 硬约束：风险回报比必须≥3.0
+		riskRewardRatio := netRewardPct / riskPct
 		if riskRewardRatio < 3.0 {
-			return fmt.Errorf("风险回报比过低(%.2f:1)，必须≥3.0:1 [风险:%.2f%% 收益:%.2f%%] [止损:%.2f 止盈:%.2f]",
-				riskRewardRatio, riskPercent, rewardPercent, d.StopLoss, d.TakeProfit)
+			return fmt.Errorf("真实风险回报比过低(%.2f:1 < 3:1) [风险:%.2f%% 净收益:%.2f%% 成本:%.2f%%]",
+				riskRewardRatio, riskPct, netRewardPct, tradingCost)
+		}
+
+		// 单笔风险验证
+		positionRiskUSD := d.PositionSizeUSD * (riskPct / 100)
+		maxRiskUSD := ctx.Account.TotalEquity * ctx.MaxRiskPerTrade
+		if positionRiskUSD > maxRiskUSD {
+			return fmt.Errorf("单笔风险(%.2f USD)超过上限(%.2f USD, %.1f%%账户净值)",
+				positionRiskUSD, maxRiskUSD, ctx.MaxRiskPerTrade*100)
 		}
 	}
-	// 动态调整止损验证
+
+	// 调整止损验证
 	if d.Action == "update_stop_loss" {
 		if d.NewStopLoss <= 0 {
-			return fmt.Errorf("新止损价格必须大于0: %.2f", d.NewStopLoss)
+			return fmt.Errorf("新止损价格必须>0: %.2f", d.NewStopLoss)
 		}
 	}
 
-	// 动态调整止盈验证
+	// 调整止盈验证
 	if d.Action == "update_take_profit" {
 		if d.NewTakeProfit <= 0 {
-			return fmt.Errorf("新止盈价格必须大于0: %.2f", d.NewTakeProfit)
+			return fmt.Errorf("新止盈价格必须>0: %.2f", d.NewTakeProfit)
 		}
 	}
 
@@ -893,4 +957,106 @@ func validateDecision(d *Decision, availableBalance float64, btcEthLeverage, alt
 	}
 
 	return nil
+}
+
+// CalculateOptimalPosition 计算最优仓位（导出函数供外部使用）
+func CalculateOptimalPosition(ctx *Context, symbol string, side string) (positionSize, stopLoss, takeProfit float64, err error) {
+	marketData, ok := ctx.MarketDataMap[symbol]
+	if !ok {
+		return 0, 0, 0, fmt.Errorf("缺少 %s 市场数据", symbol)
+	}
+
+	currentPrice := marketData.CurrentPrice
+	atr14 := marketData.LongerTermContext.ATR14
+
+	// 判断是否山寨币
+	isAltcoin := symbol != "BTCUSDT" && symbol != "ETHUSDT"
+
+	// 计算波动率自适应仓位
+	suggestedSize, stopDistance := market.CalculateAdaptivePositionSize(
+		ctx.Account.TotalEquity,
+		atr14,
+		currentPrice,
+		ctx.MaxRiskPerTrade,
+		isAltcoin,
+	)
+
+	// 应用相关性风险权重
+	if corr, ok := ctx.CorrelationMap[symbol]; ok {
+		suggestedSize *= corr.RiskWeight
+	}
+
+	// 计算止损止盈
+	if side == "long" {
+		stopLoss = currentPrice - stopDistance
+		takeProfit = currentPrice + stopDistance*3.5 // RR 1:3.5（扣除成本后约1:3）
+	} else {
+		stopLoss = currentPrice + stopDistance
+		takeProfit = currentPrice - stopDistance*3.5
+	}
+
+	// 应用杠杆上限
+	maxLeverage := ctx.AltcoinLeverage
+	maxPositionValue := ctx.Account.AvailableBalance * float64(maxLeverage) * 0.9
+	if !isAltcoin {
+		maxLeverage = ctx.BTCETHLeverage
+		maxPositionValue = ctx.Account.AvailableBalance * float64(maxLeverage) * 0.9
+	}
+
+	if suggestedSize > maxPositionValue {
+		suggestedSize = maxPositionValue
+	}
+
+	return suggestedSize, stopLoss, takeProfit, nil
+}
+
+// GetTradingRecommendation 获取交易建议（导出函数）
+func GetTradingRecommendation(ctx *Context, symbol string) string {
+	marketData, ok := ctx.MarketDataMap[symbol]
+	if !ok {
+		return "缺少市场数据"
+	}
+
+	var recommendations []string
+
+	// 市场状态
+	state, confidence := market.GetMarketState(marketData)
+	recommendations = append(recommendations, fmt.Sprintf("市场状态: %s (置信度%d%%)", state, confidence))
+
+	// 趋势方向
+	if marketData.LongerTermContext.EMA20 > marketData.LongerTermContext.EMA50 {
+		recommendations = append(recommendations, "4小时EMA: 多头排列")
+	} else {
+		recommendations = append(recommendations, "4小时EMA: 空头排列")
+	}
+
+	// 资金费率
+	fundingPct := marketData.FundingRate * 100
+	if fundingPct > 0.05 {
+		recommendations = append(recommendations, fmt.Sprintf("资金费率: %.4f%% (做空有利)", fundingPct))
+	} else if fundingPct < -0.05 {
+		recommendations = append(recommendations, fmt.Sprintf("资金费率: %.4f%% (做多有利)", fundingPct))
+	}
+
+	// MACD背离检测
+	if marketData.LongerTermContext != nil && len(marketData.LongerTermContext.MACDHist) >= 3 {
+		prices := marketData.MidTermSeries1h.MidPrices
+		macdHist := marketData.LongerTermContext.MACDHist
+		bullDiv, bearDiv := market.DetectDivergence(prices, macdHist)
+		if bullDiv {
+			recommendations = append(recommendations, "⚠️ 看涨背离信号")
+		}
+		if bearDiv {
+			recommendations = append(recommendations, "⚠️ 看跌背离信号")
+		}
+	}
+
+	// 相关性
+	if corr, ok := ctx.CorrelationMap[symbol]; ok {
+		if corr.IsHighCorr {
+			recommendations = append(recommendations, fmt.Sprintf("BTC相关性: %.2f (高，需降低仓位)", corr.BTCCorr))
+		}
+	}
+
+	return strings.Join(recommendations, " | ")
 }
