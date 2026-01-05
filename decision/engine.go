@@ -1,7 +1,6 @@
 package decision
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -687,6 +686,11 @@ func fixMissingQuotes(jsonStr string) string {
 // ExtractDecisionsRobust 健壮的决策提取（使用正则）
 // ExtractDecisionsRobust 健壮的决策提取（修复版）
 func ExtractDecisionsRobust(response string) ([]Decision, string, error) {
+	// 如果响应为空，返回空结果
+	if strings.TrimSpace(response) == "" {
+		return nil, "", fmt.Errorf("响应为空")
+	}
+
 	// 使用JSON提取器
 	jsonStr, err := jsonExtractor.ExtractJSONArray(response)
 	if err != nil {
@@ -701,43 +705,29 @@ func ExtractDecisionsRobust(response string) ([]Decision, string, error) {
 		}
 	}
 
-	// 🆕 修复：提取更完整的思维链，包含JSON决策内容
-	cotTrace := buildCompleteCotTrace(response, jsonStr)
+	// 提取AI分析部分（JSON之前的文本）
+	cotTrace := extractAnalysisPart(response)
 
 	return decisions, cotTrace, nil
 }
 
-// 🆕 新增：构建完整的思维链（包含JSON决策展示）
-func buildCompleteCotTrace(response, jsonStr string) string {
+// 🆕 提取分析部分（不包含JSON）
+func extractAnalysisPart(response string) string {
 	// 找到JSON数组开始位置
 	arrayStart := strings.Index(response, "[")
-
-	// 提取分析部分（JSON之前的内容）
-	analysisPart := ""
-	if arrayStart > 0 {
-		analysisPart = strings.TrimSpace(response[:arrayStart])
+	if arrayStart <= 0 {
+		return ""
 	}
+
+	// 提取JSON之前的内容
+	analysisPart := strings.TrimSpace(response[:arrayStart])
 
 	// 清理markdown代码块标记
 	analysisPart = strings.TrimSuffix(analysisPart, "```json")
 	analysisPart = strings.TrimSuffix(analysisPart, "```")
 	analysisPart = strings.TrimSpace(analysisPart)
 
-	// 🆕 将JSON决策格式化后追加到思维链
-	var sb strings.Builder
-	sb.WriteString(analysisPart)
-	sb.WriteString("\n\n**JSON决策内容**:\n```json\n")
-
-	// 格式化JSON以便阅读
-	var prettyJSON bytes.Buffer
-	if err := json.Indent(&prettyJSON, []byte(jsonStr), "", "  "); err == nil {
-		sb.WriteString(prettyJSON.String())
-	} else {
-		sb.WriteString(jsonStr)
-	}
-	sb.WriteString("\n```")
-
-	return sb.String()
+	return analysisPart
 }
 
 // parseDecisionsOneByOne 逐个解析决策对象
@@ -1095,6 +1085,7 @@ func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error)
 
 	calculateCorrelationMatrix(ctx)
 
+	// 评估现有持仓
 	positionDecisions := evaluateExistingPositions(ctx)
 
 	shouldCallAI := shouldCallAIForNewOpportunities(ctx)
@@ -1114,10 +1105,8 @@ func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error)
 			if err != nil {
 				log.Printf("⚠️ 调用AI API失败: %v", err)
 			} else {
-				// 使用优化后的JSON解析
 				aiDecisions, cotTrace, _ = ExtractDecisionsRobust(aiResponse)
 
-				// 验证决策
 				var validDecisions []Decision
 				for _, d := range aiDecisions {
 					if d.Action == "open_long" || d.Action == "open_short" {
@@ -1143,11 +1132,64 @@ func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error)
 		log.Printf("⚠️ 决策验证警告: %v", err)
 	}
 
+	// 🆕 统一生成完整的 CoTTrace（包含所有决策来源）
+	finalCoTTrace := buildFinalCoTTrace(cotTrace, positionDecisions, aiDecisions, allDecisions)
+
 	return &FullDecision{
-		CoTTrace:  cotTrace,
+		CoTTrace:  finalCoTTrace,
 		Decisions: allDecisions,
 		Timestamp: time.Now(),
 	}, nil
+}
+
+// 🆕 新增：构建完整的思维链（统一处理所有决策来源）
+func buildFinalCoTTrace(aiCotTrace string, positionDecisions, aiDecisions, allDecisions []Decision) string {
+	var sb strings.Builder
+
+	// 1. 如果有AI分析，先添加AI的思维链
+	if aiCotTrace != "" {
+		sb.WriteString(aiCotTrace)
+		sb.WriteString("\n\n")
+	}
+
+	// 2. 如果有持仓管理决策，添加说明
+	if len(positionDecisions) > 0 {
+		hasNonHold := false
+		for _, d := range positionDecisions {
+			if d.Action != "hold" {
+				hasNonHold = true
+				break
+			}
+		}
+
+		if hasNonHold {
+			sb.WriteString("**📊 持仓管理决策**:\n")
+			for _, d := range positionDecisions {
+				if d.Action == "hold" {
+					continue
+				}
+				sb.WriteString(fmt.Sprintf("- %s: %s - %s\n", d.Symbol, d.Action, d.Reasoning))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	// 3. 添加最终决策的JSON格式
+	if len(allDecisions) > 0 {
+		sb.WriteString("**📋 决策JSON**:\n```json\n")
+		jsonBytes, err := json.MarshalIndent(allDecisions, "", "  ")
+		if err == nil {
+			sb.WriteString(string(jsonBytes))
+		}
+		sb.WriteString("\n```")
+	}
+
+	result := sb.String()
+	if result == "" {
+		return "无决策输出"
+	}
+
+	return result
 }
 
 // initializeDefaults 初始化默认参数
