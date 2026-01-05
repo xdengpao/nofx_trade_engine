@@ -1179,9 +1179,9 @@ func parseFloat(v interface{}) (float64, error) {
 // CalculateAdaptivePositionSize 计算波动率自适应仓位（新增核心函数）
 func CalculateAdaptivePositionSize(equity, atr, currentPrice, riskPct float64, isAltcoin bool) (positionSize, stopDistance float64) {
 	// ATR倍数：山寨币波动大，用更大倍数
-	multiplier := 2.5 // BTC/ETH
+	multiplier := 1.8 // BTC/ETH
 	if isAltcoin {
-		multiplier = 3.5
+		multiplier = 2.5
 	}
 
 	// 止损距离 = ATR × 倍数
@@ -1292,4 +1292,158 @@ func DetectDivergence(prices, macdValues []float64) (bullishDiv, bearishDiv bool
 	}
 
 	return bullishDiv, bearishDiv
+}
+
+// ============================================================================
+// 辅助函数（新增）
+// ============================================================================
+
+// GetLastValue 安全获取切片最后一个值
+func GetLastValue(slice []float64) float64 {
+	if len(slice) == 0 {
+		return 0
+	}
+	return slice[len(slice)-1]
+}
+
+// GetLastNValues 获取切片最后N个值
+func GetLastNValues(slice []float64, n int) []float64 {
+	if len(slice) == 0 {
+		return nil
+	}
+	if n >= len(slice) {
+		return slice
+	}
+	return slice[len(slice)-n:]
+}
+
+// FormatCompact 紧凑格式输出市场数据（用于AI prompt）
+func FormatCompact(data *Data) string {
+	var sb strings.Builder
+
+	// 基础信息
+	sb.WriteString(fmt.Sprintf("价格: %.4f | 1h: %+.2f%% | 4h: %+.2f%%\n",
+		data.CurrentPrice, data.PriceChange1h, data.PriceChange4h))
+
+	// 趋势信息
+	trendStrength := "震荡"
+	if data.CurrentADX > 25 {
+		if data.CurrentDIPlus > data.CurrentDIMinus {
+			trendStrength = "强上升"
+		} else {
+			trendStrength = "强下降"
+		}
+	} else if data.CurrentADX > 20 {
+		trendStrength = "趋势形成中"
+	}
+	sb.WriteString(fmt.Sprintf("ADX: %.1f (%s) | RSI14: %.1f | 资金费率: %.4f%%\n",
+		data.CurrentADX, trendStrength, data.CurrentRSI14, data.FundingRate*100))
+
+	// 4H关键信息
+	if data.LongerTermContext != nil {
+		ctx := data.LongerTermContext
+		emaStatus := "横盘"
+		if ctx.EMA20 > ctx.EMA50*1.005 {
+			emaStatus = "多头排列"
+		} else if ctx.EMA20 < ctx.EMA50*0.995 {
+			emaStatus = "空头排列"
+		}
+		sb.WriteString(fmt.Sprintf("4H: %s | ATR14: %.4f | 布林位置: %.1f%%\n",
+			emaStatus, ctx.ATR14, ctx.PricePosition*100))
+	}
+
+	return sb.String()
+}
+
+// GetTrendDirection 获取趋势方向（简化版）
+func GetTrendDirection(data *Data) (direction string, strength float64) {
+	if data.CurrentADX < 20 {
+		return "NEUTRAL", data.CurrentADX
+	}
+
+	if data.CurrentDIPlus > data.CurrentDIMinus {
+		if data.CurrentADX > 25 {
+			return "STRONG_BULL", data.CurrentADX
+		}
+		return "WEAK_BULL", data.CurrentADX
+	} else {
+		if data.CurrentADX > 25 {
+			return "STRONG_BEAR", data.CurrentADX
+		}
+		return "WEAK_BEAR", data.CurrentADX
+	}
+}
+
+// Is4HTrendReversed 检查4H趋势是否反转
+func Is4HTrendReversed(data *Data, originalDirection string) bool {
+	if data == nil || data.LongerTermContext == nil {
+		return false
+	}
+
+	ctx := data.LongerTermContext
+
+	// 获取最新的DI值
+	diPlus := GetLastValue(ctx.DIPlus)
+	diMinus := GetLastValue(ctx.DIMinus)
+	adx := GetLastValue(ctx.ADXValues)
+
+	// 如果ADX切片为空，使用CurrentADX
+	if adx == 0 {
+		adx = data.CurrentADX
+	}
+	if diPlus == 0 {
+		diPlus = data.CurrentDIPlus
+	}
+	if diMinus == 0 {
+		diMinus = data.CurrentDIMinus
+	}
+
+	if originalDirection == "long" {
+		// 做多时，检查是否转空
+		if adx > 25 && diMinus > diPlus {
+			return true
+		}
+		// EMA死叉
+		if ctx.EMA20 < ctx.EMA50 {
+			return true
+		}
+	} else if originalDirection == "short" {
+		// 做空时，检查是否转多
+		if adx > 25 && diPlus > diMinus {
+			return true
+		}
+		// EMA金叉
+		if ctx.EMA20 > ctx.EMA50 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// GetTrendInfo 获取详细趋势信息
+func GetTrendInfo(data *Data) (adx, diPlus, diMinus float64) {
+	if data == nil {
+		return 0, 0, 0
+	}
+
+	adx = data.CurrentADX
+	diPlus = data.CurrentDIPlus
+	diMinus = data.CurrentDIMinus
+
+	// 如果有4H数据，优先使用最新的4H数据
+	if data.LongerTermContext != nil {
+		ctx := data.LongerTermContext
+		if len(ctx.ADXValues) > 0 {
+			adx = ctx.ADXValues[len(ctx.ADXValues)-1]
+		}
+		if len(ctx.DIPlus) > 0 {
+			diPlus = ctx.DIPlus[len(ctx.DIPlus)-1]
+		}
+		if len(ctx.DIMinus) > 0 {
+			diMinus = ctx.DIMinus[len(ctx.DIMinus)-1]
+		}
+	}
+
+	return adx, diPlus, diMinus
 }
