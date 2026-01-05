@@ -1,6 +1,7 @@
 package decision
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -684,31 +685,59 @@ func fixMissingQuotes(jsonStr string) string {
 }
 
 // ExtractDecisionsRobust 健壮的决策提取（使用正则）
+// ExtractDecisionsRobust 健壮的决策提取（修复版）
 func ExtractDecisionsRobust(response string) ([]Decision, string, error) {
-	// 提取思维链
-	cotTrace := ""
-	arrayStart := strings.Index(response, "[")
-	if arrayStart > 0 {
-		cotTrace = strings.TrimSpace(response[:arrayStart])
-	}
-
 	// 使用JSON提取器
 	jsonStr, err := jsonExtractor.ExtractJSONArray(response)
 	if err != nil {
-		// 回退到旧方法
 		return extractDecisionsFallback(response)
 	}
 
 	var decisions []Decision
 	if err := json.Unmarshal([]byte(jsonStr), &decisions); err != nil {
-		// 尝试逐个对象解析
 		decisions, err = parseDecisionsOneByOne(jsonStr)
 		if err != nil {
-			return nil, cotTrace, fmt.Errorf("JSON解析失败: %w", err)
+			return nil, "", fmt.Errorf("JSON解析失败: %w", err)
 		}
 	}
 
+	// 🆕 修复：提取更完整的思维链，包含JSON决策内容
+	cotTrace := buildCompleteCotTrace(response, jsonStr)
+
 	return decisions, cotTrace, nil
+}
+
+// 🆕 新增：构建完整的思维链（包含JSON决策展示）
+func buildCompleteCotTrace(response, jsonStr string) string {
+	// 找到JSON数组开始位置
+	arrayStart := strings.Index(response, "[")
+
+	// 提取分析部分（JSON之前的内容）
+	analysisPart := ""
+	if arrayStart > 0 {
+		analysisPart = strings.TrimSpace(response[:arrayStart])
+	}
+
+	// 清理markdown代码块标记
+	analysisPart = strings.TrimSuffix(analysisPart, "```json")
+	analysisPart = strings.TrimSuffix(analysisPart, "```")
+	analysisPart = strings.TrimSpace(analysisPart)
+
+	// 🆕 将JSON决策格式化后追加到思维链
+	var sb strings.Builder
+	sb.WriteString(analysisPart)
+	sb.WriteString("\n\n**JSON决策内容**:\n```json\n")
+
+	// 格式化JSON以便阅读
+	var prettyJSON bytes.Buffer
+	if err := json.Indent(&prettyJSON, []byte(jsonStr), "", "  "); err == nil {
+		sb.WriteString(prettyJSON.String())
+	} else {
+		sb.WriteString(jsonStr)
+	}
+	sb.WriteString("\n```")
+
+	return sb.String()
 }
 
 // parseDecisionsOneByOne 逐个解析决策对象
